@@ -1,3 +1,6 @@
+// 注：阶段 1 只需理解用途，不必读解析器内部：工具调用参数是 JSON 字符串碎片，例如依次到达
+// 注：'{"pa'、'th": "src/a'、'.ts"}'。UI 想在流式过程中就显示 {path: "src/a"}，这就需要"容错的增量解析"。
+// 注：重点看：模块注释的规则、StreamingJsonParser.append/snapshot 的契约、文件末尾的 ToolCallArgumentsStream。
 /**
  * Incremental, tolerant parsing of JSON text that arrives in pieces, such as streamed tool-call arguments.
  *
@@ -12,10 +15,23 @@
  * - An unterminated literal shows its value once it is a prefix of `true`, `false` or `null`; an unterminated number
  *   shows its value when the digits read so far form a number (an exponent without digits is ignored).
  *
+ * 译：对分段到达的 JSON 文本（如流式工具调用参数）做增量、容错的解析。
+ * append() 每段只读一次，所以整条流的时间和内存与长度成线性；snapshot() 返回目前已读文本对应的值。
+ * 快照是普通 JSON 值，返回后永不改变：解析器把仍未闭合的容器（"开放路径"）复制进每个新快照，
+ * 已完成的容器和字符串则共享。未完成文本的规则与 parseStreamingJson() 一致：
+ * - 未结束的字符串显示已读到的字符；未结束的转义先扣住，直到完整。
+ * - 未闭合的容器显示已读到的成员和元素。
+ * - 键或值还没开始的成员被省略。
+ * - 未结束的字面量，在它是 true/false/null 的前缀时显示其值；未结束的数字在已读位数构成数字时显示（缺数字的指数被忽略）。
+ *
  * Malformed text is read leniently, the way `repairJson()` and `parseStreamingJson()` treat it: raw control characters
  * in strings are kept, an invalid escape such as `\d` stays literal text, missing commas and colons are tolerated,
  * values in invalid positions and unknown words are dropped, and text after the root value is ignored. The parser never
  * throws. Callers that need the exact value of the finished text parse it once, e.g. with `parseToolCallArguments()`.
+ *
+ * 译：格式错误的文本按 repairJson()/parseStreamingJson() 的方式宽松读取：保留字符串里的原始控制字符，
+ * 无效转义（如 \d）保持字面文本，容忍缺失的逗号和冒号，丢弃位置不合法的值和未知单词，忽略根值之后的文本。
+ * 解析器永不抛异常。需要完整文本精确值的调用方，最后自己完整解析一次，例如用 parseToolCallArguments()。
  *
  * Differences from `parseStreamingJson()` on incomplete text: trailing whitespace inside an unterminated string is
  * kept (it was trimmed), a string that contains a raw control character or an invalid escape stays visible while it
@@ -31,6 +47,11 @@
  * length plus a constant; `snapshot()` spends it and returns the previous snapshot while the open path costs more than
  * the credit. So a document that keeps a very large container open (thousands of elements) shows a preview that lags
  * a little behind the text, and no input makes the total work grow faster than the text.
+ *
+ * 译：append() 还返回这段文本造成的变化（set / append），给自己维护一份值副本的写入方增量应用。
+ * 代价：复制开放路径的开销等于其成员和元素数。每次 append() 按长度挣得"复制额度"，snapshot() 花掉它；
+ * 额度不够时返回上一个快照。所以一个保持超大容器开放（上千元素）的文档，预览会略微滞后于文本，
+ * 但任何输入都不会让总工作量增长得比文本更快。
  */
 
 import type { JsonValue, ToolCall } from "../types.ts";
@@ -106,6 +127,7 @@ const QUOTE = 0x22;
 const BACKSLASH = 0x5c;
 
 /** Incremental, tolerant JSON parser; see the module comment for its rules and costs. */
+/** 译：增量、容错的 JSON 解析器；规则和代价见模块注释。 */
 export class StreamingJsonParser {
 	#root: JsonValue | undefined = undefined;
 	#done = false;
@@ -123,8 +145,10 @@ export class StreamingJsonParser {
 
 	/**
 	 * Read the next piece of text; returns the changes it made, in order. Costs time linear in `text.length`.
+	 * 译：读入下一段文本；按顺序返回它造成的变化。耗时与 text.length 成线性。
 	 */
 	append(text: string): readonly JsonChange[] {
+		// 注：一个字符一个字符地推进状态机：在字符串里、在数字/字面量里、或在结构字符（{}[],:）上。
 		this.#credit += CREDIT_PER_APPEND + CREDIT_PER_CHARACTER * text.length;
 		this.#changes = [];
 		if (this.#string !== undefined) this.#string.change = undefined;
@@ -142,6 +166,8 @@ export class StreamingJsonParser {
 	 * The value of the text read so far: `undefined` before a value starts, otherwise a plain JSON value that never
 	 * changes afterwards. Returns the previous snapshot while the text read since did not change the value, or while a
 	 * fresh copy of the open path is not yet paid for (see the module comment).
+	 * 译：已读文本的值：值开始之前是 undefined，之后是一个此后不再改变的普通 JSON 值。
+	 * 若自上次以来值没有变化，或复制开放路径的额度还不够（见模块注释），返回上一个快照。
 	 */
 	snapshot(): JsonValue | undefined {
 		if (!this.#dirty) return this.#snapshot;
@@ -448,6 +474,10 @@ export class StreamingJsonParser {
  * The arguments of one streaming tool call: the raw text, for the one full parse when the call ends, and a
  * `StreamingJsonParser` for the partial arguments in between. Providers keep one per call in their own stream state,
  * never on the content block, so the raw text never reaches partial messages or transcripts.
+ * 译：一次流式工具调用的参数：保存原始文本（调用结束时做唯一一次完整解析），以及一个 StreamingJsonParser
+ * （提供中途的部分参数）。provider 在自己的流状态里为每个调用保存一个，绝不挂在内容块上，
+ * 所以原始文本永远不会进入 partial 消息或对话记录。
+ * 注：openai-completions.ts 里：append() 对应 toolcall_delta，finish() 在 finishBlock 里调用。
  */
 export class ToolCallArgumentsStream {
 	#text = "";
@@ -456,11 +486,13 @@ export class ToolCallArgumentsStream {
 	#arguments: ToolCall["arguments"] = {};
 
 	/** The raw argument text received so far. */
+	/** 译：目前收到的原始参数文本。 */
 	get text(): string {
 		return this.#text;
 	}
 
 	/** Append a piece of argument text; returns the partial arguments, a new object whenever they changed. */
+	/** 译：追加一段参数文本；返回部分参数，只要有变化就是一个新对象（没变化则返回同一个对象，方便 UI 判断是否重绘）。 */
 	append(delta: string): ToolCall["arguments"] {
 		this.#text += delta;
 		this.#parser.append(delta);
@@ -470,6 +502,8 @@ export class ToolCallArgumentsStream {
 	/**
 	 * Take the provider's complete argument text. When it continues the text so far, returns the missing piece as
 	 * `delta`; otherwise starts over with `text`. Either way returns the partial arguments of `text`.
+	 * 译：接收服务方给出的完整参数文本。如果它是已有文本的延续，把缺的那段作为 delta 返回；否则从 text 重新开始。
+	 * 两种情况都返回 text 的部分参数。（用于每次发送"全量参数"而非增量的服务。）
 	 */
 	replace(text: string): { readonly delta: string | undefined; readonly arguments: ToolCall["arguments"] } {
 		if (text.startsWith(this.#text)) {
@@ -482,6 +516,7 @@ export class ToolCallArgumentsStream {
 	}
 
 	/** The final arguments: one full parse of the complete text, which reports malformed arguments. */
+	/** 译：最终参数：对完整文本做一次完整解析；参数格式错误时通过 argumentsError 报告，而不是抛异常。 */
 	finish(): Pick<ToolCall, "arguments" | "argumentsError"> {
 		return parseToolCallArguments(this.#text);
 	}
@@ -491,6 +526,7 @@ export class ToolCallArgumentsStream {
 		if (snapshot === this.#snapshot) return this.#arguments;
 		this.#snapshot = snapshot;
 		// Tool arguments are an object; any other partial value shows as no arguments yet.
+		// 译：工具参数是对象；其他任何部分值都视为"还没有参数"。
 		this.#arguments =
 			typeof snapshot === "object" && snapshot !== null && !Array.isArray(snapshot)
 				? (snapshot as ToolCall["arguments"])

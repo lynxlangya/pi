@@ -1,17 +1,24 @@
+// 注：上下文 token 估算（不调用分词器，只按字符数粗估）。用于 maxTokens 夹紧（simple-options.ts）和判断何时压缩历史。
+// 注：思路：最近一条有效 assistant 消息的 usage 是服务端报的真实值，最准；它之后新增的消息再按"字符数 / 3.5"估算。
 import type { AssistantMessage, ImageContent, Message, TextContent, TranscriptContext, Usage } from "../types.ts";
 import { getSystemMessageText } from "./text.ts";
 
 export interface ContextUsageEstimate {
 	/** Estimated total context tokens. */
+	/** 译：估算的上下文总 token 数。 */
 	tokens: number;
 	/** Tokens reported by the most recent applicable assistant usage block. */
+	/** 译：最近一条可用的 assistant 消息 usage 报告的 token 数（真实值）。 */
 	usageTokens: number;
 	/** Estimated tokens after the most recent applicable assistant usage block. */
+	/** 译：那条消息之后的消息的估算 token 数。 */
 	trailingTokens: number;
 	/** Index of the applicable message that provided usage, or null when none exists. */
+	/** 译：提供 usage 的那条消息的下标；没有则为 null。 */
 	lastUsageIndex: number | null;
 }
 
+// 注：经验值：约 3.5 字符 ≈ 1 token；一张图按 4800 字符（约 1371 token）估算。中文实际会偏差较大，只用于留余量。
 const CHARS_PER_TOKEN = 3.5;
 const ESTIMATED_IMAGE_CHARS = 4800;
 
@@ -43,6 +50,7 @@ export function estimateTextAndImageContentTokens(content: string | Array<TextCo
 	return Math.ceil(estimateTextAndImageContentChars(content) / CHARS_PER_TOKEN);
 }
 
+// 注：单条消息估算：system 算文本 + 增删的工具定义；user/toolResult 算文本和图片；assistant 算文本、思考、工具名和参数 JSON。
 export function estimateMessageTokens(message: Message): number {
 	let chars = 0;
 
@@ -78,6 +86,7 @@ function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage
 			const assistant = message as AssistantMessage;
 			// A newer prefix message was inserted after this response (for example, a
 			// compaction summary), so its usage cannot describe the current prefix.
+			// 译：这条响应之后又插入了更新的前缀消息（例如压缩摘要），所以它的 usage 不能描述当前的前缀。
 			const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
 			if (
 				usageAppliesToPrefix &&
@@ -94,6 +103,8 @@ function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage
 	return usageInfo;
 }
 
+// 注：总估算 = 最近有效 usage 的真实值 + 之后消息的估算值；没有任何 usage 时全部按字符估算。
+// 注：error/aborted 的消息、或被压缩摘要"过时"的消息，其 usage 不采用。
 export function estimateContextTokens(context: TranscriptContext | readonly Message[]): ContextUsageEstimate {
 	const messages = "messages" in context ? context.messages : context;
 	const usageInfo = getLastAssistantUsageInfo(messages);

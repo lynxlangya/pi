@@ -1,3 +1,6 @@
+// 注：Transcript（对话记录）工具集。核心概念：pi 把系统提示和工具列表也当作消息（role: "system"）放进历史，
+// 注：对话中途可以追加 system 消息来改提示（sections）或增删工具（toolsAdded/toolsRemoved）。
+// 注：各 Api 发请求时，再按服务支持程度把这些"增量"重放成服务能理解的形状。阶段 1 重点看前 5 个函数和 resolveTranscript。
 import type { Context, Message, SystemMessage, Tool, ToolReference, TranscriptContext } from "../types.ts";
 import { contentText, getSystemMessageText } from "./text.ts";
 
@@ -6,6 +9,7 @@ export type { TranscriptContext } from "../types.ts";
 /**
  * Build the leading system message for a prompt and tool set. Returns undefined when
  * both are empty, so an empty transcript stays empty.
+ * 译：根据系统提示和工具集构造开头的 system 消息。两者都为空时返回 undefined，让空记录保持为空。
  */
 export function createInitialSystemMessage(
 	systemPrompt: string | undefined,
@@ -26,6 +30,10 @@ export function createInitialSystemMessage(
  * Fold `Context.systemPrompt` and `Context.tools` into a leading system message.
  * This is the only entry point that produces a {@link TranscriptContext}; every
  * provider-facing function expects the result.
+ * 译：把 Context.systemPrompt 和 Context.tools 折叠成开头的一条 system 消息。
+ * 这是产生 TranscriptContext 的唯一入口；所有面向 provider 的函数都要求传入它的结果。
+ * 注：例：{ systemPrompt: "你是助手", tools: [read], messages: [user] }
+ *   → { messages: [{ role: "system", content: "你是助手", toolsAdded: [read] }, user] }
  */
 export function normalizeContext(context: Context): TranscriptContext {
 	const initialMessage = createInitialSystemMessage(context.systemPrompt, context.tools);
@@ -36,6 +44,7 @@ export function normalizeContext(context: Context): TranscriptContext {
 /**
  * Any message list. The replay helpers only read entries whose role is `"system"`, so
  * agent transcripts that carry custom message roles can be passed without filtering.
+ * 译：任意消息列表。重放类函数只读取 role 为 "system" 的条目，所以带自定义角色的 agent 记录可以不经过滤直接传入。
  */
 export type TranscriptMessages = readonly { role: string }[];
 
@@ -44,17 +53,20 @@ function isSystemMessage(message: { role: string }): message is SystemMessage {
 }
 
 /** Return the leading system message, if the transcript starts with one. */
+/** 译：如果记录以 system 消息开头，返回它。 */
 export function getInitialSystemMessage(messages: TranscriptMessages): SystemMessage | undefined {
 	const first = messages[0];
 	return first && isSystemMessage(first) ? first : undefined;
 }
 
 /** Drop the leading system message for APIs that carry the prompt outside the message list. */
+/** 译：去掉开头的 system 消息，给"系统提示放在消息列表之外"的 API 用（如 Anthropic 的顶层 system 字段）。 */
 export function withoutInitialSystemMessage(messages: Message[]): Message[] {
 	return getInitialSystemMessage(messages) ? messages.slice(1) : messages;
 }
 
 /** Resolve the tools available after applying every transcript delta in order. */
+/** 译：按顺序应用记录里所有的工具增删后，得到当前可用的工具。 */
 export function getCurrentTools(messages: TranscriptMessages): Tool[] {
 	const tools = new Map<string, Tool>();
 	for (const message of messages) {
@@ -69,6 +81,8 @@ export function getCurrentTools(messages: TranscriptMessages): Tool[] {
  * Replay every system message into one leading system message holding the current
  * prompt and tools. Later `content` is appended to the base prompt, `sections` are
  * patched by name, and tools are resolved with {@link getCurrentTools}.
+ * 译：把所有 system 消息重放成一条开头的 system 消息，包含当前的提示和工具。
+ * 后续的 content 追加到基础提示之后，sections 按名字打补丁（null 表示删除），工具用 getCurrentTools 求出。
  */
 export function getCurrentSystemMessage(messages: TranscriptMessages): SystemMessage | undefined {
 	const content: string[] = [];
@@ -96,6 +110,7 @@ export function getCurrentSystemMessage(messages: TranscriptMessages): SystemMes
 }
 
 /** Render the current system prompt text after replaying every system message. */
+/** 译：重放所有 system 消息后，渲染出当前的系统提示文本。 */
 export function getCurrentSystemPrompt(messages: TranscriptMessages): string {
 	const message = getCurrentSystemMessage(messages);
 	return message ? getSystemMessageText(message) : "";
@@ -104,6 +119,7 @@ export function getCurrentSystemPrompt(messages: TranscriptMessages): string {
 /**
  * Rebuild the transcript for APIs without mid-conversation system messages: the replayed
  * system message leads, and every later system message is dropped.
+ * 译：为不支持对话中途 system 消息的 API 重建记录：重放后的 system 消息放在开头，之后的 system 消息全部去掉。
  */
 export function collapseSystemMessages(context: TranscriptContext): TranscriptContext {
 	const head = getCurrentSystemMessage(context.messages);
@@ -112,6 +128,8 @@ export function collapseSystemMessages(context: TranscriptContext): TranscriptCo
 }
 
 /** Keep later system messages in place when the model accepts them; otherwise collapse them. */
+/** 译：模型接受中途 system 消息时原样保留，否则折叠（collapseSystemMessages）。 */
+// 注：openai-completions.ts 的 stream 开头调用的就是它，DeepSeek 不支持中途 system，会被折叠。
 export function resolveTranscript(
 	context: TranscriptContext,
 	supportsMidConvoSystemMessages: boolean | undefined,
@@ -120,6 +138,7 @@ export function resolveTranscript(
 }
 
 /** Strip executable and display-only fields from a tool before transcript comparison or persistence. */
+/** 译：在比较或持久化之前，去掉工具里可执行的、仅用于显示的字段，只留给模型看的声明。 */
 export function toToolDeclaration(tool: Tool): Tool {
 	return {
 		name: tool.name,
@@ -136,6 +155,9 @@ export function toToolDeclaration(tool: Tool): Tool {
  * schema metadata keys (TypeBox's non-enumerable kind marks) and `undefined` fields that a structural comparison would see, and
  * builds both objects with the same key order, so comparing the serialized declarations
  * is exact. This avoids a deep-equal dependency in a browser-safe package.
+ * 译：两个工具对模型声明的接口是否相同。两边都先经过 toToolDeclaration：它的 JSON 往返会去掉 schema 元数据键
+ * （TypeBox 不可枚举的 kind 标记）和 undefined 字段，并以相同的键顺序构造两个对象，所以比较序列化结果是精确的。
+ * 这样避免在一个浏览器安全的包里引入 deep-equal 依赖。
  */
 export function declarationsEqual(left: Tool, right: Tool): boolean {
 	return JSON.stringify(toToolDeclaration(left)) === JSON.stringify(toToolDeclaration(right));
@@ -147,6 +169,7 @@ export interface ToolStateChanges {
 }
 
 /** Compare two complete tool states. A changed definition is a removal followed by an addition. */
+/** 译：比较前后两个完整的工具状态。定义变了的工具记为"先删除再添加"。 */
 export function getToolStateChanges(previous: readonly Tool[], current: readonly Tool[]): ToolStateChanges {
 	const previousTools = new Map(previous.map((tool) => [tool.name, tool]));
 	const currentTools = new Map(current.map((tool) => [tool.name, tool]));
@@ -167,6 +190,7 @@ export function getToolStateChanges(previous: readonly Tool[], current: readonly
 }
 
 /** Every definition referenced by transcript tool state, in first-declaration order. */
+/** 译：记录里出现过的所有工具定义，按首次声明的顺序。 */
 export function getDeclaredTools(messages: TranscriptMessages): Tool[] {
 	const definitions = new Map<string, Tool>();
 	for (const message of messages) {
@@ -226,6 +250,11 @@ function findLastNonAdditiveToolChange(systemMessages: readonly SystemMessage[])
  * - `"changes"`: every tool, including the initial ones, is declared in place, and a later
  *   declaration under the same name replaces the earlier one. Removals are not expressible on
  *   the wire, so the transport announces them as text and the removed tools stay declared.
+ * 译：传输层在首次请求之后表达工具变化的能力：
+ * - "none"：只有顶层工具列表，它始终保存当前工具。
+ * - "additions"：可以在后面的消息里添加工具，但不能删除或重定义。
+ * - "changes"：所有工具（包括最初的）都在原位声明，后来的同名声明替换先前的。删除无法在协议上表达，
+ *   所以传输层以文本告知删除，被删的工具仍保持已声明状态。
  */
 export type TranscriptToolSupport = "none" | "additions" | "changes";
 
@@ -248,6 +277,11 @@ export interface TranscriptTools {
  * expressed in place, so the top-level list becomes the tool state after the last such change;
  * later additions stay anchored, and the cached prefix is invalidated once per removal instead
  * of on every later addition. With `"none"`, the top-level list is the current tool set.
+ * 译：在顶层请求字段和原位变更之间分配工具声明。
+ * "changes"：顶层列表为空，每条 system 消息（包括开头那条）都在原位声明工具。
+ * "additions"：删除或重定义无法原位表达，所以顶层列表取"最后一次此类变更之后"的工具状态，之后的添加保持原位，
+ *   这样前缀缓存只在每次删除时失效一次，而不是每次添加都失效。
+ * "none"：顶层列表就是当前工具集（openai-completions 对大多数服务走这条）。
  */
 export function resolveTranscriptTools(messages: TranscriptMessages, support: TranscriptToolSupport): TranscriptTools {
 	const systemMessages = messages.filter(isSystemMessage);

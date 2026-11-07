@@ -1,3 +1,5 @@
+// 注：上下文溢出检测。Agent 遇到溢出时不该"重试"，而该"压缩历史（compaction）后再试"，所以要和普通错误区分开。
+// 注：难点：每家报错文本都不一样，有的甚至不报错（静默截断），所以只能靠一张正则表 + 用量推断。
 import type { AssistantMessage } from "../types.ts";
 
 /**
@@ -7,6 +9,8 @@ import type { AssistantMessage } from "../types.ts";
  * the model's context window or the provider's request byte-size limit.
  *
  * Provider-specific patterns (with example error messages):
+ * 译：用于识别各家服务"上下文溢出"错误的正则。输入超过模型上下文窗口、或超过服务的请求字节上限时会匹配。
+ * 下面按服务列出示例错误文本（原文保留，便于对照正则）。
  *
  * - Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
  * - Anthropic: "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"
@@ -78,6 +82,9 @@ const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(n
  * Example: Bedrock formats throttling errors as "ThrottlingException: Too many tokens,
  * please wait before trying again." which would match the /too many tokens/i overflow
  * pattern without this exclusion.
+ * 译：表示"非溢出"错误（如限流、服务端错误）的模式。匹配这些的错误消息会被排除在溢出检测之外，
+ * 即使它们也匹配某个 OVERFLOW_PATTERN。例：Bedrock 把限流错误格式化成 "ThrottlingException: Too many tokens,
+ * please wait..."，没有这个排除就会被 /too many tokens/i 误判为溢出。
  */
 const NON_OVERFLOW_PATTERNS = [
 	/^(Throttling error|Service unavailable):/i, // AWS Bedrock non-overflow errors (human-readable prefixes from formatBedrockError)
@@ -95,6 +102,10 @@ const NON_OVERFLOW_PATTERNS = [
  *    successfully. For these, we check if usage.input exceeds the context window.
  * 3. Length-stop overflow: Xiaomi MiMo can return "length" with zero output when
  *    the input fills the context window.
+ * 译：判断一条 assistant 消息是否代表上下文溢出。处理三种情况：
+ * 1. 报错型溢出：多数服务返回 stopReason "error" 并带有特定错误文本。
+ * 2. 静默溢出：有些服务接受超长请求并正常返回，此时检查 usage.input 是否超过上下文窗口。
+ * 3. length 型溢出：小米 MiMo 在输入占满窗口时可能返回 "length" 且输出为 0。
  *
  * ## Reliability by Provider
  *
@@ -136,6 +147,9 @@ const NON_OVERFLOW_PATTERNS = [
  * 3. Create a regex pattern that matches the error
  * 4. The pattern should be added to OVERFLOW_PATTERNS in this file, or
  *    check the errorMessage yourself before calling this function
+ * 译：自定义 provider：通过 settings.json 加的自定义模型，这个函数可能识别不出它们的溢出错误。要支持的话：
+ * 发一个超过上下文窗口的请求 → 查看响应里的 errorMessage → 写一个能匹配它的正则 →
+ * 加到本文件的 OVERFLOW_PATTERNS，或者在调用本函数之前自己检查 errorMessage。
  *
  * @param message - The assistant message to check
  * @param contextWindow - Optional context window size for detecting silent overflow (z.ai)
@@ -143,8 +157,10 @@ const NON_OVERFLOW_PATTERNS = [
  */
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
 	// Case 1: Check error message patterns
+	// 译：情况 1：检查错误文本模式。
 	if (message.stopReason === "error" && message.errorMessage) {
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
+		// 译：跳过匹配已知"非溢出"模式的消息（如限流）。
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
 		if (!isNonOverflow) {
 			if (OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
@@ -157,6 +173,7 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 	}
 
 	// Case 2: Silent overflow (z.ai style) - successful but usage exceeds context
+	// 译：情况 2：静默溢出（z.ai 式）：请求成功，但用量超过了上下文窗口。
 	if (contextWindow && message.stopReason === "stop") {
 		const inputTokens = message.usage.input + message.usage.cacheRead;
 		if (inputTokens > contextWindow) {
@@ -167,6 +184,8 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 	// Case 3: Length-stop overflow (Xiaomi MiMo style) - server truncates oversized input
 	// to fit the context window, leaving no room for output. Returns stopReason "length"
 	// with output=0 and input+cacheRead filling the context window.
+	// 译：情况 3：length 型溢出（小米 MiMo 式）：服务端把超长输入截断到正好填满窗口，没有空间输出，
+	// 译：于是返回 stopReason "length"、output=0，且 input+cacheRead 占满窗口。
 	if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
 		const inputTokens = message.usage.input + message.usage.cacheRead;
 		if (inputTokens >= contextWindow * 0.99) {
@@ -182,6 +201,8 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
  * Such responses may be caused by context pressure or provider-side truncation, so callers
  * can make one bounded compact-and-retry attempt. `desiredMaxOutput` must be the original
  * limit before any context-based clamping.
+ * 译：判断一次 length 停止是否发生在"调用方或模型本意的输出上限"之下。这种响应可能是上下文压力或服务端截断导致的，
+ * 调用方可以做一次有限的"压缩后重试"。desiredMaxOutput 必须是按上下文夹紧之前的原始上限。
  */
 export function isRecoverableLength(message: AssistantMessage, desiredMaxOutput: number): boolean {
 	return message.stopReason === "length" && desiredMaxOutput > 0 && message.usage.output < desiredMaxOutput;
