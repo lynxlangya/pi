@@ -63,6 +63,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { learnLog, learnMaskHeaders } from "./utils/diagnostics.ts";
 import { type ClientIdentity, getOpenCodeSessionHeaders, mergeClientIdentity } from "./utils/identity.ts";
 import {
 	assertChatModel,
@@ -1032,6 +1033,13 @@ class ModelsImpl implements MutableModels {
 			...(identity === undefined ? {} : { identity }),
 		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 
+		// 注：[调试] 认证解析和请求头合并的结果。apiKey 只显示前 3 位和长度。
+		// 注：OpenAI 兼容服务的 key 不在 headers 里，而是之后由 OpenAI SDK 放进 Authorization 头。
+		learnLog("models", `applyAuth 完成: ${model.provider}/${model.id}`, {
+			baseUrl: requestModel.baseUrl,
+			apiKey: apiKey ? `${apiKey.slice(0, 3)}…(${apiKey.length} chars)` : "(none)",
+			headers: learnMaskHeaders(headers ?? {}),
+		});
 		return { requestModel, requestOptions };
 	}
 
@@ -1045,6 +1053,9 @@ class ModelsImpl implements MutableModels {
 		// 注：第 2 步：用 lazyStream 立刻返回流，后台执行：找 provider → 解析认证 → 调 provider.stream()
 		// 注：后台任何一步抛异常，都会变成流里的 error 事件，调用方不会收到异常
 		const transcript = normalizeContext(context);
+		learnLog("models", `stream 入口: ${model.provider}/${model.id}`, {
+			messages: transcript.messages.map((m) => m.role),
+		});
 		return lazyStream(
 			model,
 			async () => {
@@ -1072,6 +1083,11 @@ class ModelsImpl implements MutableModels {
 	// 注：与 stream 完全对称，区别只在最后调用 provider.streamSimple（统一的 reasoning 选项）
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
+		// 注：[调试] normalizeContext 之后只剩 messages：systemPrompt 和 tools 已经折叠成 system 消息
+		learnLog("models", `streamSimple 入口: ${model.provider}/${model.id}`, {
+			messages: transcript.messages.map((m) => m.role),
+			reasoning: options?.reasoning,
+		});
 		return lazyStream(
 			model,
 			async () => {

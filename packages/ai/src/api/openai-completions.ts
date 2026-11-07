@@ -40,6 +40,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { learnLog, learnVerbose } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -334,6 +335,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 	const stream = new AssistantMessageEventStream();
 	// 注：把 TranscriptContext 规整成消息列表（服务不支持对话中途的 system 消息时，会折叠处理）。
 	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
+	// 注：[调试] 不支持中途 system 消息的服务，这里前后的角色序列会不同（多条 system 被折叠）
+	learnLog("openai", "resolveTranscript 前后的消息角色", {
+		before: context.messages.map((m) => m.role),
+		after: normalizedContext.messages.map((m) => m.role),
+	});
+	const learnStartedAt = Date.now();
 
 	// 注：async IIFE：立即执行但不 await，让 stream 先返回给调用方。
 	(async () => {
@@ -371,6 +378,15 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			// 注：取 key → 解析兼容开关 → 建 SDK 客户端 → 拼请求体。任何一步抛错都会落到下面的 catch。
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const compat = getCompat(model);
+			// 注：[调试] 兼容层的关键开关：决定思考参数格式、max_tokens 字段名、是否回传 reasoning_content 等
+			learnLog("openai", "compat（兼容开关，DeepSeek 由 detectCompat/catalog 决定）", {
+				thinkingFormat: compat.thinkingFormat,
+				maxTokensField: compat.maxTokensField,
+				requiresReasoningContentOnAssistantMessages: compat.requiresReasoningContentOnAssistantMessages,
+				supportsFinishReason: compat.supportsFinishReason,
+				supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
+				supportsDeveloperRole: compat.supportsDeveloperRole,
+			});
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				compat.supportsOpenAIGrammarTools,
@@ -401,6 +417,18 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 			}
+			// 注：[调试] 最终请求体摘要：messages 和 tools 只显示概况，其余字段原样打印（思考参数、max_tokens 都在这里）
+			const { messages: learnMessages, tools: learnTools, ...learnRest } = params;
+			learnLog("openai", "buildParams 完成，请求体摘要", {
+				...learnRest,
+				messages: learnMessages.map((m) => m.role),
+				tools: learnTools?.map((t) => (t.type === "function" ? t.function.name : t.type)),
+			});
+			learnVerbose(
+				"openai",
+				"完整请求体 messages（convertMessages 的输出）",
+				JSON.stringify(learnMessages, null, 2),
+			);
 			// 注：SDK 自带重试关掉（maxRetries: 0），统一交给 pi 的 retryProviderRequest，所有 provider 的重试策略一致。
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
@@ -417,6 +445,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			);
 			// 注：onResponse 钩子：拿到 HTTP 状态码和响应头（比如限流相关的头）。
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			learnLog(
+				"openai",
+				`HTTP 已连通: status=${response.status} (+${Date.now() - learnStartedAt}ms，即首包前的等待)`,
+			);
 			// 注：===== 第 2 步：HTTP 已连通，发出 start 事件，开始消费 SSE 流 =====
 			stream.push({ type: "start", partial: output });
 
@@ -489,6 +521,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						// 注：JSON 参数流结束：做最终解析，把结果写回 block.arguments。
 						Object.assign(block, input.arguments.finish());
 					}
+					// 注：[调试] 工具参数在流式过程中是"尽力解析的部分对象"，这里是 finish() 后的最终值
+					learnLog("openai", `toolcall_end: ${block.name}`, { id: block.id, arguments: block.arguments });
 					stream.push({
 						type: "toolcall_end",
 						contentIndex,
@@ -502,6 +536,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				if (!textBlock) {
 					textBlock = { type: "text", text: "" };
 					blocks.push(textBlock);
+					learnLog("openai", `text_start（第一个正文增量到达，+${Date.now() - learnStartedAt}ms）`);
 					stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
 				}
 				return textBlock;
@@ -514,6 +549,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						thinkingSignature,
 					};
 					blocks.push(thinkingBlock);
+					// 注：[调试] thinkingSignature 记录思考来自哪个字段，DeepSeek 应是 reasoning_content
+					learnLog(
+						"openai",
+						`thinking_start（思考字段 "${thinkingSignature}"，+${Date.now() - learnStartedAt}ms）`,
+					);
 					stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingBlock), partial: output });
 				}
 				return thinkingBlock;
@@ -553,6 +593,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						toolCallBlocksById.set(toolCall.id, block);
 					}
 					blocks.push(block);
+					learnLog("openai", `toolcall_start: name="${name}" id="${toolCall.id ?? ""}" index=${streamIndex}`);
 					stream.push({
 						type: "toolcall_start",
 						contentIndex: getContentIndex(block),
@@ -580,7 +621,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 			// 注：===== 第 3 步：逐个消费 SSE chunk =====
 			// 注：每个 chunk 可能带：usage（通常在最后一个）、finish_reason、思考增量、文本增量、工具调用增量。
+			let learnChunkCount = 0;
 			for await (const chunk of openaiStream) {
+				learnChunkCount++;
+				// 注：[调试] verbose 模式下打印每个原始 SSE chunk，对照下面的解析逻辑看
+				learnVerbose("openai", `chunk #${learnChunkCount}`, JSON.stringify(chunk));
 				await options?.onProviderStreamEvent?.(chunk, model);
 				if (!chunk || typeof chunk !== "object") continue;
 
@@ -594,6 +639,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				// 注：用量通常在最后一个 chunk 里（前提是请求带了 stream_options.include_usage）。
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model);
+					// 注：[调试] 对照原始 usage 和解析结果：cached tokens 会从 prompt_tokens 里拆出来变成 cacheRead
+					learnLog("openai", "usage 原始值 → parseChunkUsage 结果", { raw: chunk.usage, parsed: output.usage });
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -611,6 +658,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					output.rawStopReason = choice.finish_reason;
 					const finishReasonResult = mapStopReason(choice.finish_reason);
 					output.stopReason = finishReasonResult.stopReason;
+					learnLog(
+						"openai",
+						`finish_reason "${choice.finish_reason}" → stopReason "${finishReasonResult.stopReason}"`,
+					);
 					if (finishReasonResult.errorMessage) {
 						output.errorMessage = finishReasonResult.errorMessage;
 					}
@@ -747,6 +798,20 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			}
 
 			// 注：成功路径：done 事件 + end()。
+			learnLog(
+				"openai",
+				`成功结束: stopReason=${output.stopReason}，共 ${learnChunkCount} 个 chunk，+${Date.now() - learnStartedAt}ms`,
+				{
+					content: output.content.map((b) =>
+						b.type === "text"
+							? `text(${b.text.length} 字符)`
+							: b.type === "thinking"
+								? `thinking(${b.thinking.length} 字符, signature=${b.thinkingSignature})`
+								: `toolCall(${b.name})`,
+					),
+					usage: output.usage,
+				},
+			);
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -769,6 +834,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
 				output.errorMessage += `\n${rawMetadata}`;
 			}
+			learnLog("openai", `失败结束: stopReason=${output.stopReason}`, output.errorMessage);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1599,6 +1665,16 @@ export function convertMessages(
 		lastRole = msg.role;
 	}
 
+	// 注：[调试] 看历史里的 assistant 消息有没有带上 reasoning_content（DeepSeek 多轮时必须回传思考）
+	learnLog(
+		"openai",
+		"convertMessages 输出",
+		params.map((m) =>
+			m.role === "assistant"
+				? `assistant(reasoning_content=${"reasoning_content" in m ? "有" : "无"}, tool_calls=${m.tool_calls?.length ?? 0})`
+				: m.role,
+		),
+	);
 	return params;
 }
 

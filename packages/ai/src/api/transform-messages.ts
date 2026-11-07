@@ -1,6 +1,7 @@
 // 注：跨 provider 的消息清洗。每个 Api 实现发请求前都会调 transformMessages，保证历史消息能被"当前模型"接受。
 // 注：典型场景：前几轮用 Claude，这一轮切到 DeepSeek，历史里 Claude 的思考签名、超长工具 id、图片都要处理。
 // 注：两遍处理：第一遍逐条改内容（图片降级、丢别家思考、规范化工具 id）；第二遍补齐"孤儿工具调用"的结果。
+
 import type {
 	Api,
 	AssistantMessage,
@@ -11,6 +12,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { learnLog } from "../utils/diagnostics.ts";
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
@@ -152,7 +154,10 @@ export function transformMessages<TApi extends Api>(
 					// plain text makes the new model treat it as part of the visible reply.
 					// 译：别的模型产生的思考直接丢弃。签名和加密推理只对产生它的模型有效；
 					// 译：而把可读的思考当普通文本发过去，新模型会把它当成可见回复的一部分。
-					if (!isSameModel) return [];
+					if (!isSameModel) {
+						learnLog("transform", `丢弃别家模型的思考块（来自 ${assistantMsg.provider}/${assistantMsg.model}）`);
+						return [];
+					}
 					// Keep redacted and signed blocks even if the thinking text is empty
 					// (OpenAI encrypted reasoning); they are needed for replay.
 					// 译：即使思考文本为空，也保留 redacted 和带签名的块（OpenAI 加密推理），回放时需要它们。
@@ -183,6 +188,7 @@ export function transformMessages<TApi extends Api>(
 					if (!isSameModel && normalizeToolCallId) {
 						const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
 						if (normalizedId !== toolCall.id) {
+							learnLog("transform", `工具调用 id 规范化: ${toolCall.id} → ${normalizedId}`);
 							toolCallIdMap.set(toolCall.id, normalizedId);
 							normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
 						}
@@ -220,6 +226,7 @@ export function transformMessages<TApi extends Api>(
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
 				if (!existingToolResultIds.has(tc.id)) {
+					learnLog("transform", `孤儿工具调用 ${tc.name}(${tc.id}) → 补一条合成结果 "No result provided"`);
 					result.push({
 						role: "toolResult",
 						toolCallId: tc.id,
@@ -256,6 +263,7 @@ export function transformMessages<TApi extends Api>(
 			// 译：- 模型应该从最后一个有效状态重试
 			const assistantMsg = msg as AssistantMessage;
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				learnLog("transform", `跳过 stopReason=${assistantMsg.stopReason} 的 assistant 消息（不回放不完整的轮次）`);
 				continue;
 			}
 
@@ -291,5 +299,10 @@ export function transformMessages<TApi extends Api>(
 	// 译：如果对话以未解决的工具调用结尾，现在合成结果。
 	closePendingToolCalls();
 
+	learnLog(
+		"transform",
+		`transformMessages: ${messages.length} 条 → ${result.length} 条`,
+		result.map((m) => m.role),
+	);
 	return result;
 }

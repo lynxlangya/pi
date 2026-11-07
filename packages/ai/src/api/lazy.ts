@@ -4,6 +4,7 @@
 // 注：解决：lazyStream 先同步返回一个空的外层流，后台跑准备工作；
 // 注：成功就把内层流的事件转发过去，失败就往外层流推一个 error 事件。调用方永远拿到流，永远不会收到异常。
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
+import { learnLog } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 
 // 注：准备阶段失败时，构造一条"空内容 + 零用量"的 assistant 错误消息。
@@ -99,12 +100,22 @@ export function lazyStream(
 		observer?.onResult?.(result);
 	};
 
+	// 注：[调试] 一次请求会看到两层 lazyStream：外层来自 Models.stream/streamSimple，内层来自 lazyApi（加载实现模块）
+	learnLog("lazy", `lazyStream: 同步返回外层流，后台开始 setup (${model.provider}/${model.id})`);
 	// 注：故意不 await：后台执行。注意 .catch 也会捕获 forwardStream 内部抛出的异常
 	setup()
-		.then((inner) => forwardStream(outer, inner, observer, observeResult))
+		.then((inner) => {
+			learnLog("lazy", `setup 完成，开始把内层流转发到外层流 (+${Date.now() - startedAt}ms)`);
+			return forwardStream(outer, inner, observer, observeResult);
+		})
 		.catch((error) => {
 			// 注：任何失败都转成 error 事件推给外层流，这就是"错误进流不抛出"的实现
 			const reason = signal?.aborted ? "aborted" : "error";
+			learnLog(
+				"lazy",
+				`setup 失败 → 转成 error 事件 (reason=${reason})`,
+				error instanceof Error ? error.message : error,
+			);
 			const message = createSetupErrorMessage(model, error, startedAt, reason);
 			const event: AssistantMessageEvent = { type: "error", reason, error: message };
 			outer.push(event);
@@ -137,11 +148,22 @@ export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: Laz
 	const api: ProviderStreams = {
 		// 注：stream 和 streamSimple 都包进 lazyStream：先 load 模块，再调用模块里真正的实现
 		stream: (model, context, options) =>
-			lazyStream(model, async () => (await load()).stream(model, context, options), undefined, options?.signal),
+			lazyStream(
+				model,
+				async () => {
+					learnLog("lazy", "lazyApi.stream: load() 实现模块（只有第一次真正 import，之后走缓存）");
+					return (await load()).stream(model, context, options);
+				},
+				undefined,
+				options?.signal,
+			),
 		streamSimple: (model, context, options) =>
 			lazyStream(
 				model,
-				async () => (await load()).streamSimple(model, context, options),
+				async () => {
+					learnLog("lazy", "lazyApi.streamSimple: load() 实现模块（只有第一次真正 import，之后走缓存）");
+					return (await load()).streamSimple(model, context, options);
+				},
 				undefined,
 				options?.signal,
 			),

@@ -13,5 +13,7 @@
 | 日期 | 文档 | 内容 |
 | --- | --- | --- |
 | 2026-11-07 | [system-prompt-中文译版-261107.md](./system-prompt-中文译版-261107.md) | pi 的系统提示词全文中文翻译，含注入的 `AGENTS.md` 与 skills 清单 |
+| 2026-11-07 | [pi-整体架构-261107.md](./pi-整体架构-261107.md) | **先读这篇**：仓库分层（两条产品线 → pi-ai → 基础包）、pi-ai 内部 3 层、阶段 1 只读的 3 个函数 |
 | 2026-11-07 | [pi-ai-README-中英对照-261107.md](./pi-ai-README-中英对照-261107.md) | `packages/ai/README.md` 阶段 1 相关章节，英文原文下附中文翻译 |
 | 2026-11-07 | [pi-ai-阅读顺序-261107.md](./pi-ai-阅读顺序-261107.md) | pi-ai 阶段 1 的逐文件阅读顺序、重点、自测题和对应测试；配合源码里的 `注：`/`译：` 批注 |
+| 2026-11-07 | [pi-ai-调试指南-261107.md](./pi-ai-调试指南-261107.md) | 用真实 DeepSeek 跑 `learning/debug/deepseek-debug.ts`，`PI_LEARN_DEBUG` 日志点、Chrome DevTools 断点和实验 |

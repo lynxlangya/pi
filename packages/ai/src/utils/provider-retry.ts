@@ -1,5 +1,7 @@
 // 注：HTTP 请求层的重试（在拿到响应流之前）。openai-completions.ts 的 stream 里用它包住 client.chat.completions.create。
 // 注：为什么不用 SDK 自带重试：SDK 的退避计时器不理会 AbortSignal，用户取消时还会傻等。所以 SDK 设 maxRetries: 0，由这里接管。
+import { learnLog } from "./diagnostics.ts";
+
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
 interface ProviderRetryOptions {
@@ -131,12 +133,21 @@ export async function retryProviderRequest<T>(
 			// 注：已取消 → 立即抛；次数用完、不是 HTTP 错误、不可重试、或在 noRetryStatuses 里 → 原样抛出。
 			// 注：抛出的错误会被 stream 的 catch 接住，变成 error 事件。
 			if (options.signal?.aborted) throw createAbortError();
-			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) throw error;
+			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) {
+				// 注：[调试] 注意 maxRetries 默认是 0，所以不传 maxRetries 时 429/5xx 也会直接失败
+				learnLog(
+					"retry",
+					`HTTP 请求失败，不再重试 (剩余次数=${retriesRemaining}, status=${isProviderError(error) ? error.status : "非 HTTP 错误"})`,
+				);
+				throw error;
+			}
 			if (error.status !== undefined && options.noRetryStatuses?.includes(error.status)) throw error;
 
 			const retryIndex = maxRetries - retriesRemaining;
 			retriesRemaining--;
-			await abortableSleep(getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs), options.signal);
+			const learnDelayMs = getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs);
+			learnLog("retry", `status=${error.status} 可重试 → 第 ${retryIndex + 1} 次重试，等待 ${learnDelayMs}ms`);
+			await abortableSleep(learnDelayMs, options.signal);
 		}
 	}
 }
