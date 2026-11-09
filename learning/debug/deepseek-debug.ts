@@ -10,12 +10,25 @@
 //   然后 Chrome 打开 chrome://inspect → 点 "inspect"，在 Sources 里打开 packages/ai/src 下的文件打断点
 //
 // key 从仓库根目录的 .deepseek.env 读取（该文件已被 git 忽略）。脚本不会打印 key。
+//
+// 每次运行还会把整次调用记成一个 jsonl 文件：learning/debug/runs/<时间>-<场景>.jsonl（不进 git）。
+// 每行一个记录，按发生顺序排列，字段：
+//   t      距脚本开始的毫秒数
+//   round  第几轮请求（basic 只有 1；tool 有 1、2）
+//   kind   context  调用方传进 pi-ai 的 Context（pi 内部格式）
+//          request  实际发给 DeepSeek 的请求体（onPayload 钩子，OpenAI 格式）
+//          response HTTP 状态码和响应头（onResponse 钩子）
+//          sse      DeepSeek 返回的每个原始 SSE chunk（onProviderStreamEvent 钩子）
+//          event    pi-ai 归一化后交给调用方的事件（去掉了每次都重复的 partial 字段）
+//          result   最终的 AssistantMessage
+//   data   内容
+// 看法：jq -c 'select(.kind=="sse")' <文件>，或直接用编辑器逐行读。
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createModels } from "../../packages/ai/src/models.ts";
 import { deepseekProvider } from "../../packages/ai/src/providers/deepseek.ts";
-import type { AssistantMessageEventStream, Context, Tool } from "../../packages/ai/src/types.ts";
+import type { AssistantMessageEvent, AssistantMessageEventStream, Context, Tool } from "../../packages/ai/src/types.ts";
 
 // ---------- 第 0 步：读 key，打开调试开关 ----------
 
@@ -37,6 +50,26 @@ process.env.PI_LEARN_DEBUG ??= "1";
 // deepseekProvider 的认证会读这个环境变量（见 providers/deepseek.ts 的 envApiKeyAuth）
 process.env.DEEPSEEK_API_KEY = loadDeepSeekKey();
 
+// ---------- 第 0.5 步：jsonl 记录器 ----------
+
+const RUN_DIR = join(import.meta.dirname, "runs");
+const scenario = process.argv[2] ?? "basic";
+const startedAt = Date.now();
+const stamp = new Date(startedAt).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+const RUN_FILE = join(RUN_DIR, `${stamp}-${scenario}.jsonl`);
+mkdirSync(RUN_DIR, { recursive: true });
+let round = 0;
+
+function record(kind: string, data: unknown): void {
+	appendFileSync(RUN_FILE, `${JSON.stringify({ t: Date.now() - startedAt, round, kind, data })}\n`);
+}
+
+// 每个增量事件都带着完整的 partial 消息，原样记下来会重复成百上千次，所以去掉
+function recordEvent(event: AssistantMessageEvent): void {
+	const { partial: _partial, ...rest } = event as AssistantMessageEvent & { partial?: unknown };
+	record("event", rest);
+}
+
 // ---------- 第 1 步：组装 Models（只注册 DeepSeek 一个 provider） ----------
 
 const models = createModels();
@@ -50,6 +83,7 @@ if (!model) throw new Error("找不到 deepseek/deepseek-flash，确认已执行
 async function printEvents(s: AssistantMessageEventStream): Promise<void> {
 	let inDelta = false;
 	for await (const event of s) {
+		recordEvent(event);
 		if (event.type === "thinking_delta" || event.type === "text_delta") {
 			if (!inDelta) process.stdout.write(event.type === "thinking_delta" ? "\n  [思考] " : "\n  [正文] ");
 			inDelta = true;
@@ -79,8 +113,28 @@ const requestOptions = {
 	// onResponse 钩子：不改源码就能拿到 HTTP 状态和响应头
 	onResponse: (response: { status: number; headers: Record<string, string> }) => {
 		console.log(`[hook] onResponse status=${response.status} content-type=${response.headers["content-type"]}`);
+		record("response", response);
+	},
+	// 返回 undefined 表示不改请求体，只是记下来
+	onPayload: (payload: unknown) => {
+		record("request", payload);
+		return undefined;
+	},
+	onProviderStreamEvent: (chunk: unknown) => {
+		record("sse", chunk);
 	},
 } as const;
+
+// 每一轮：先记下传进来的 Context，再发请求、打印事件、记下最终消息
+async function runRound(context: Context) {
+	round++;
+	record("context", context);
+	const s = models.streamSimple(model!, context, requestOptions);
+	await printEvents(s);
+	const message = await s.result();
+	record("result", message);
+	return message;
+}
 
 // ---------- 场景 basic：一问一答 ----------
 
@@ -89,9 +143,7 @@ async function runBasic(): Promise<void> {
 		systemPrompt: "你是一个简洁的助手，回答不超过两句话。",
 		messages: [{ role: "user", content: "TCP 三次握手为什么不是两次？", timestamp: Date.now() }],
 	};
-	const s = models.streamSimple(model!, context, requestOptions);
-	await printEvents(s);
-	const message = await s.result();
+	const message = await runRound(context);
 	console.log("\n[result] stopReason=%s usage=%o cost=%o", message.stopReason, message.usage, message.usage.cost);
 }
 
@@ -119,9 +171,7 @@ async function runTool(): Promise<void> {
 	};
 
 	console.log("\n========== 第 1 轮 ==========");
-	const first = models.streamSimple(model!, context, requestOptions);
-	await printEvents(first);
-	const firstMessage = await first.result();
+	const firstMessage = await runRound(context);
 	context.messages.push(firstMessage);
 
 	const toolCalls = firstMessage.content.filter((b) => b.type === "toolCall");
@@ -142,14 +192,12 @@ async function runTool(): Promise<void> {
 	}
 
 	console.log("\n========== 第 2 轮（带工具结果） ==========");
-	const second = models.streamSimple(model!, context, requestOptions);
-	await printEvents(second);
-	const secondMessage = await second.result();
+	const secondMessage = await runRound(context);
 	console.log("\n[result] stopReason=%s usage=%o", secondMessage.stopReason, secondMessage.usage);
 }
 
 // ---------- 入口 ----------
 
-const scenario = process.argv[2] ?? "basic";
 if (scenario === "tool") await runTool();
 else await runBasic();
+console.log(`\n[record] 本次调用已记录到 ${RUN_FILE}`);
