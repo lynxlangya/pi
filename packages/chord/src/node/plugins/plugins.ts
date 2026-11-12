@@ -5,11 +5,14 @@
 // plugin's loaded facet. `rollout` runs the app's steps in order (one result per host) and clears the marks of plugins
 // applied on every host of every step.
 
+import { access } from "node:fs/promises";
+import { join } from "node:path";
 import type { Context } from "../../context/index.ts";
 import type { Principal } from "../../data/index.ts";
 import type { Host, LoadReport, PluginFacet, ReloadReport } from "../../host/index.ts";
 import { Batch, type BatchError } from "../../state/internal.ts";
 import type { Watchable } from "../../watch.ts";
+import type { BaseInputs } from "./base-inputs.ts";
 import { type AppApi, type BuiltFacet, buildFacet } from "./build.ts";
 import { type Discovery, discoverPlugins, type Plugin, type PluginRoot, sameFiles } from "./discover.ts";
 import type { HostPackages } from "./evaluate.ts";
@@ -35,7 +38,11 @@ export type PluginsOptions = {
 	 * keep external: `{ server: { platform: "node", hostPackages: ["@earendil-works/chord", "@app/core"] }, … }`.
 	 */
 	readonly kinds: Readonly<Record<string, KindDefinition>>;
-	/** The app's base code: a change sets `base` (the app restarts its hosts; Chord restarts nothing). */
+	/**
+	 * The server's own base code, files and directories, hashed when the component is created: `base` is set while one
+	 * differs from it or a source file is new in one of the directories (the app restarts its hosts; Chord restarts
+	 * nothing).
+	 */
 	readonly base?: readonly string[];
 	/** Where the app serves browser builds' assets: the URL prefix their imports evaluate to. */
 	readonly publicPath?: string;
@@ -92,7 +99,8 @@ export interface Plugins {
 	readonly discovery: Discovery;
 	/**
 	 * Builds every facet of `names` (and of plugins discovered since the last build; discovery runs again first when
-	 * the plugin set changed): plain data. It changes no current set: a rollout ships it.
+	 * the plugin set changed, or when a named plugin is unknown to it or its files are gone before the watcher said
+	 * so): plain data. It changes no current set: a rollout ships it.
 	 */
 	build(names: readonly string[], context: Context): Promise<Built>;
 	/**
@@ -134,10 +142,11 @@ export interface Plugins {
 	/** Installs plugin `name`'s dependencies (`installDependencies`): its install mark clears, and it is dirty. */
 	installDependencies(name: string, context: Context): Promise<void>;
 	/**
-	 * Adds `files` to the app's base code (beside `base`): a change of one sets `base`. For files the app learns after
-	 * creating the component, a base bundle's inputs; files under `node_modules` are never watched.
+	 * Adds a running base artifact's record (a base bundle's `inputs`, beside `base`): `base` is set while one of its
+	 * files differs from the bytes it read or is gone; each is compared once now (settles once those comparisons did).
+	 * Files under `node_modules` are never watched.
 	 */
-	watchBase(files: readonly string[]): void;
+	watchBase(inputs: BaseInputs): Promise<void>;
 	/**
 	 * Installs new plugins from git or npm into `root`, one of the roots (`installPlugin`), and marks `set`: the next
 	 * build discovers and builds them. Returns their names.
@@ -193,7 +202,8 @@ class PluginsComponent implements Plugins {
 
 	async build(names: readonly string[], context: Context): Promise<Built> {
 		const before = new Map(this.#discovery.plugins.map((plugin) => [plugin.name, plugin]));
-		if (!this.#discovered || this.#watcher.needsDiscovery) await this.#discover(context);
+		if (!this.#discovered || this.#watcher.needsDiscovery || (await unseen(names, before)))
+			await this.#discover(context);
 		const now = this.#discovery.plugins;
 		const removed = [...before.keys()].filter((name) => !now.some((plugin) => plugin.name === name));
 		// A plugin whose files moved (a single file became a directory, a facet file came or went) is built again too.
@@ -293,8 +303,8 @@ class PluginsComponent implements Plugins {
 		return { steps: done, stopped: undefined };
 	}
 
-	watchBase(files: readonly string[]): void {
-		this.#watcher.baseFiles(files);
+	watchBase(inputs: BaseInputs): Promise<void> {
+		return this.#watcher.recordBase(inputs);
 	}
 
 	async installDependencies(name: string, context: Context): Promise<void> {
@@ -373,6 +383,31 @@ class PluginsComponent implements Plugins {
 		return built;
 	}
 }
+
+/**
+ * Whether a named plugin changed in a way the watcher has not reported yet (its events lag behind the files, more on
+ * some platforms than others): discovery does not know it, or a file discovery found for it is gone. A build of named
+ * plugins never trusts the watcher's timing for them.
+ */
+async function unseen(names: readonly string[], known: ReadonlyMap<string, Plugin>): Promise<boolean> {
+	for (const name of names) {
+		const plugin = known.get(name);
+		if (plugin === undefined) return true;
+		const files = [
+			...Object.values(plugin.facets),
+			...(plugin.layout === "directory" ? [join(plugin.dir, "package.json")] : []),
+		];
+		for (const file of files) if (!(await exists(file))) return true;
+	}
+	return false;
+}
+
+/** Whether `path` exists. */
+const exists = (path: string): Promise<boolean> =>
+	access(path).then(
+		() => true,
+		() => false,
+	);
 
 /**
  * Applies `built` to `set`, `kind`'s current set: its removed plugins and those rebuilt without a facet of `kind` leave

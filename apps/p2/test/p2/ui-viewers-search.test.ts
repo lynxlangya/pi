@@ -25,6 +25,7 @@ describe("search, viewers, artifacts and cost parity", { skip: !browserTests }, 
 			).create({ cwd: fixture.workspace, title: "Viewer fixture" }, BACKGROUND_CONTEXT)
 		).id;
 		browser = await Browser.start();
+		await browser.signIn(fixture.owner);
 	});
 	after(async () => {
 		await browser?.close();
@@ -39,29 +40,33 @@ describe("search, viewers, artifacts and cost parity", { skip: !browserTests }, 
 		await chat.send({ text: "Unique search needle", requestId: "needle" }, BACKGROUND_CONTEXT);
 		await until(chat.view, (view) => JSON.stringify(view?.entries).includes("Echo: Unique search needle"));
 		await browser.metrics(1280, 900);
-		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${id}`);
+		// Recents' list page searches its sessions' titles and messages.
+		await browser.open(`http://127.0.0.1:${fixture.server.port}/list/recent`);
 		await browser.wait(
-			`document.querySelector('input[aria-label="Search sessions and messages"]')&&!document.querySelector('.offline')`,
+			`document.querySelector('.list-page input[aria-label="Search sessions and messages"]')&&!document.querySelector('.offline')`,
 		);
 		await browser.evaluate(input('input[aria-label="Search sessions and messages"]', "Search fixture"));
-		await browser.wait(`[...document.querySelectorAll('.session-title')].some(e=>e.textContent==='Search fixture')`);
+		await browser.wait(
+			`[...document.querySelectorAll('.list-page .session-title')].map(e=>e.textContent).join()==='Search fixture'`,
+		);
 		await browser.evaluate(input('input[aria-label="Search sessions and messages"]', "Unique search needle"));
-		await browser.wait(`document.querySelector('.hit')?.textContent.includes('Unique search needle')`);
+		await browser.wait(`document.querySelector('.list-page .hit')?.textContent.includes('Unique search needle')`);
 		await sessions.archive({ id: session.id }, BACKGROUND_CONTEXT);
-		// Refresh the submitted query, as mobile does on an edit; toggles then query the archive scope.
+		// Refresh the submitted query, as mobile does on an edit: the archived session is no longer in Recents.
 		await browser.evaluate(input('input[aria-label="Search sessions and messages"]', "Unique search needle "));
-		await browser.wait(`!document.querySelector('.hit')`);
-		await browser.click(".drawer-foot .foot-button");
-		await browser.wait(`document.querySelector('.hit')?.textContent.includes('Unique search needle')`);
+		await browser.wait(`!document.querySelector('.list-page .hit')`);
+		// The Archive's list page searches the archive.
+		await browser.click(".sidebar-section[data-key=archive] .group-label");
+		await browser.wait(`location.pathname==='/list/archive' && document.querySelector('.list-page input')`);
+		await browser.evaluate(input('input[aria-label="Search sessions and messages"]', "Unique search needle"));
+		await browser.wait(`document.querySelector('.list-page .hit')?.textContent.includes('Unique search needle')`);
 		assert(
 			(await search.search({ query: "Unique search needle", archived: true }, BACKGROUND_CONTEXT)).messages.length >
 				0,
 		);
-		await browser.click(".hit");
+		await browser.click(".list-page .hit");
 		await browser.wait(`location.pathname==='/s/${session.id}'`);
 		await until(sessions.sessions, (rows) => rows?.find((row) => row.id === session.id)?.archivedAt === null);
-		await browser.evaluate(input('input[aria-label="Search sessions and messages"]', ""));
-		await browser.click(".drawer-foot .foot-button");
 	});
 	it("lists every immutable artifact version newest first, opens only on a click and returns with Back", async () => {
 		const owner = fixture.browser(),
@@ -111,12 +116,117 @@ describe("search, viewers, artifacts and cost parity", { skip: !browserTests }, 
 		);
 		await browser.click("[role=dialog] button[aria-label=Close]");
 	});
+	it("links artifacts to their viewer: a modified click is the browser's, the link address opens the viewer", async () => {
+		await browser.metrics(1280, 900);
+		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${id}`);
+		await browser.wait(`document.querySelector('a[aria-label="Open Demo artifact"]')`);
+		const card = await browser.evaluate<string>(
+			`document.querySelector('a[aria-label="Open Demo artifact"]').getAttribute('href')`,
+		);
+		assert(card.startsWith(`/s/${id}?viewer=artifacts&at=`), card);
+		await browser.click('button[aria-label="Artifacts (2)"]');
+		await browser.wait(`document.querySelectorAll('a.artifact-row').length===2`);
+		const row = await browser.evaluate<string>(`document.querySelector('a.artifact-row').getAttribute('href')`);
+		assert(row.startsWith(`/s/${id}?viewer=artifacts&at=`), row);
+		// Cmd (macOS), Ctrl, Shift or the middle button: the browser opens the link elsewhere; this page stays.
+		const point = await browser.evaluate<{ x: number; y: number }>(
+			`(()=>{const r=document.querySelector('a.artifact-row').getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}})()`,
+		);
+		for (const [button, modifiers] of [
+			["left", process.platform === "darwin" ? 4 : 2],
+			["left", 8],
+			["middle", 0],
+		] as const) {
+			await browser.call("Input.dispatchMouseEvent", {
+				type: "mousePressed",
+				...point,
+				button,
+				modifiers,
+				clickCount: 1,
+			});
+			await browser.call("Input.dispatchMouseEvent", {
+				type: "mouseReleased",
+				...point,
+				button,
+				modifiers,
+				clickCount: 1,
+			});
+		}
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.equal(await browser.evaluate<number>(`document.querySelectorAll('.viewer-panel').length`), 0);
+		assert.equal(await browser.evaluate<string>("location.pathname+location.search"), `/s/${id}`);
+		// A new tab at the row's address opens that version's viewer over the conversation; the address bar shows the
+		// conversation, and closing the viewer stays there.
+		await browser.open(`http://127.0.0.1:${fixture.server.port}${row}`);
+		await browser.wait(`document.querySelector('.viewer-panel iframe')`);
+		assert.match(
+			await browser.evaluate<string>(`document.querySelector('.viewer-head').textContent`),
+			/Demo artifact.*html · version 2/,
+		);
+		assert.equal(await browser.evaluate<string>("location.pathname+location.search"), `/s/${id}`);
+		await browser.click('button[aria-label="Close viewer"]');
+		await browser.wait(
+			`!document.querySelector('.viewer-panel') && document.querySelector('a[aria-label="Open Demo artifact"]')`,
+		);
+	});
+	it("docks the artifact list on the right on wide screens, under its viewer, and toggles it from the top bar", async () => {
+		const button = 'button[aria-label="Artifacts (2)"]';
+		const docked = "document.querySelectorAll('#side-dock [data-testid=artifact-panel] .artifact-row').length===2";
+		await browser.metrics(1280, 900);
+		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${id}`);
+		await browser.wait(`document.querySelector('${button}')`);
+		// The session opens with the panels it last had (src/web/session-panels.ts); an earlier test left the list open.
+		if ((await browser.evaluate<string>(`document.querySelector('${button}').ariaPressed`)) === "true") {
+			await browser.click(button);
+			await browser.wait(`document.querySelector('${button}').ariaPressed === "false"`);
+		}
+		await browser.click(button);
+		await browser.wait(docked);
+		assert.equal(await browser.evaluate<number>(`document.querySelectorAll('.sheet-layer').length`), 0);
+		assert.equal(await browser.evaluate<string>(`document.querySelector('${button}').ariaPressed`), "true");
+		// Its left edge drags to resize it; the width is kept for every side panel.
+		await browser.evaluate("localStorage.removeItem('p2-side-panel-width')");
+		const width = () =>
+			browser.evaluate<number>("document.querySelector('#side-dock .side-panel').getBoundingClientRect().width");
+		assert.equal(await width(), 460);
+		const point = await browser.evaluate<{ x: number; y: number }>(
+			`(()=>{const r=document.querySelector('.side-panel-resize').getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}})()`,
+		);
+		await browser.call("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
+		const to = { x: point.x - 100, y: point.y };
+		await browser.call("Input.dispatchMouseEvent", { type: "mouseMoved", ...to, button: "left", buttons: 1 });
+		await browser.call("Input.dispatchMouseEvent", { type: "mouseReleased", ...to, button: "left", clickCount: 1 });
+		// The pointer sets the edge: about 100px wider, as grabbed within the 6px handle.
+		await browser.wait(`Math.abs(Number(localStorage.getItem('p2-side-panel-width'))-560)<=3`);
+		const dragged = await width();
+		assert.equal(String(dragged), await browser.evaluate<string>("localStorage.getItem('p2-side-panel-width')"));
+		// A version opens its viewer above the list; Back returns to the list, still docked.
+		await browser.click("#side-dock .artifact-row");
+		await browser.wait(`document.querySelector('.viewer-panel iframe') && ${docked}`);
+		await browser.evaluate("history.back()");
+		await browser.wait(`!document.querySelector('.viewer-panel') && ${docked}`);
+		await browser.click(button);
+		await browser.wait("!document.querySelector('#side-dock [data-testid=artifact-panel]')");
+		await browser.click(button);
+		await browser.wait(docked);
+		// One thing at a time: a run's activity replaces the list, the list replaces the activity.
+		await browser.click("[data-testid=activity]");
+		await browser.wait(
+			"document.querySelector('#side-dock .activity-panel') && !document.querySelector('[data-testid=artifact-panel]')",
+		);
+		assert.equal(await width(), dragged);
+		await browser.click(button);
+		await browser.wait(`${docked} && !document.querySelector('.activity-panel')`);
+		await browser.evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))");
+		await browser.wait("!document.querySelector('#side-dock [data-testid=artifact-panel]')");
+		await browser.evaluate("localStorage.removeItem('p2-side-panel-width')");
+	});
 	it("opens a sent-file card as a conservative viewer and explicitly downloads the same snapshot", async () => {
 		const chat = await holdIn(fixture.browser(), Chat, { session: id, conversation: 1 }, "participant");
 		await chat.send({ text: "send-file", requestId: "snapshot" }, BACKGROUND_CONTEXT);
 		await until(chat.view, (view) => JSON.stringify(view?.entries).includes("created.txt"));
-		await browser.wait(`document.querySelector('button[aria-label="Open created.txt"]')`);
-		await browser.click('button[aria-label="Open created.txt"]');
+		await browser.wait(`document.querySelector('a[aria-label="Open created.txt"]')`);
+		await browser.click('a[aria-label="Open created.txt"]');
 		await browser.wait(`document.querySelector('.viewer-content')?.textContent.includes('A private test snapshot')`);
 		assert.equal(await browser.evaluate<number>(`document.querySelectorAll('.viewer-content iframe').length`), 0);
 		assert.equal(

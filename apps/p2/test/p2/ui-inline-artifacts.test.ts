@@ -89,6 +89,7 @@ describe("inline artifacts in Chromium", { skip: !browserTests }, () => {
 		fixture = await startFixture({ web: true });
 		sessions = await holdIn(fixture.browser(), Sessions, {}, "owner");
 		browser = await Browser.start();
+		await browser.signIn(fixture.owner);
 	});
 	after(async () => {
 		await browser?.close();
@@ -164,10 +165,8 @@ describe("inline artifacts in Chromium", { skip: !browserTests }, () => {
 			);
 			await fitsFrame(`session=${id}&name=${name}&`, DRAWN, frame(name));
 		}
-		await browser.evaluate(
-			`document.querySelector('button[aria-label="Open Flow"]').scrollIntoView({ block: "center" })`,
-		);
-		await browser.click('button[aria-label="Open Flow"]');
+		await browser.evaluate(`document.querySelector('a[aria-label="Open Flow"]').scrollIntoView({ block: "center" })`);
+		await browser.click('a[aria-label="Open Flow"]');
 		await browser.wait(`document.querySelector('.viewer-panel iframe')`);
 		assert.match(
 			await browser.evaluate<string>(`document.querySelector('.viewer-head').textContent`),

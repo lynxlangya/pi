@@ -13,8 +13,16 @@ import {
 } from "react";
 import { ActivityRow } from "./activity/ActivityRow.tsx";
 import { ActivityLayer } from "./activity/ActivitySheet.tsx";
-import { type ChatItem, chatItems, DEFAULT_DETAIL, type Detail, type ToolActivityTable } from "./activity/model.ts";
+import {
+	type ChatItem,
+	chatItems,
+	DEFAULT_DETAIL,
+	type Detail,
+	type ToolActivityTable,
+	wheelThought,
+} from "./activity/model.ts";
 import { Results } from "./activity/Results.tsx";
+import { handoff, type SlotHeights, SlotHeightsContext } from "./activity/ThoughtSlot.tsx";
 import { CopyButton } from "./Code.tsx";
 import { BranchFrom, OpenConversation, OpenPeerConversation, ReplyTo, RevealEntry } from "./chat-context.ts";
 import {
@@ -31,6 +39,7 @@ import {
 import { imageSize } from "./image-size.ts";
 import { Markdown } from "./Markdown.tsx";
 import { RowEstimator, type RowFeatures } from "./row-estimate.ts";
+import { Time } from "./Time.tsx";
 import type { Item, Transcript } from "./transcript.ts";
 import { type RowRange, revealInTranscripts, type TranscriptScroll } from "./use-chat-scroll.ts";
 
@@ -264,16 +273,24 @@ function rowFeatures(row: TranscriptRow, width: number): RowFeatures {
 					incoming(item) ? "incoming" : "user",
 					item.author ? "named" : "",
 					item.images.length ? "images" : "",
+					// The owner's sent messages have a line of actions (Copy, the time) below the bubble; queued ones not yet.
+					!incoming(item) && item.entryId !== undefined ? "actions" : "",
 					spacing,
 				].join(":"),
 				text: item.text.length,
 				fixed: imagesHeight(item.images, width),
 			};
-		case "activity":
-			// One line, the wheel, however many calls the run made; at detail 4 a row per call.
+		case "activity": {
+			const thought = wheelThought(item.entries ?? [], item.working);
+			// A working wheel may also carry up to three lines of its latest thought.
 			return item.rows
 				? { kind: `activity:rows:${item.steps.length}:${spacing}`, text: 0, fixed: 0 }
-				: { kind: `activity:${spacing}`, text: 0, fixed: 0 };
+				: {
+						kind: `activity:${thought ? "thought:" : ""}${spacing}`,
+						text: Math.min(thought?.text.length ?? 0, 300),
+						fixed: 0,
+					};
+		}
 		case "thought":
 			// One line until opened; at detail 4 in full.
 			return item.full
@@ -311,15 +328,6 @@ export const rowEstimates = new RowEstimator<TranscriptRow>(rowFeatures, 120);
 /** Whether a message is someone else's (a subagent's, another session's, a guest's): `Incoming`, not a bubble. */
 const incoming = (item: Extract<Item, { type: "user" }>): boolean =>
 	Boolean(item.agent || item.peer || item.author?.kind === "guest");
-
-/** A message's time: the clock today, with the date before. */
-function sentAt(at: number): string {
-	const date = new Date(at);
-	const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-	return date.toDateString() === new Date().toDateString()
-		? time
-		: `${date.toLocaleDateString([], { day: "numeric", month: "short" })} ${time}`;
-}
 
 const AGENT_VERBS = { answered: "answered", question: "asks", note: "wrote", failed: "failed" } as const;
 
@@ -366,7 +374,12 @@ function Incoming({ item }: { item: Extract<Item, { type: "user" }> }) {
 			<span className="incoming-icon">{sender.icon}</span>
 			<span className="incoming-line">
 				<span className="incoming-name">{sender.name}</span> · {sender.what}
-				{item.at !== undefined && ` · ${sentAt(item.at)}`}
+				{item.at !== undefined && (
+					<>
+						{" · "}
+						<Time at={item.at} />
+					</>
+				)}
 			</span>
 		</>
 	);
@@ -460,49 +473,60 @@ function UserMessage({ item }: { item: Extract<Item, { type: "user" }> }) {
 	const branch = useContext(BranchFrom);
 	// Only what reached the agent can be edited: a chat message (chat mode) is not part of its history.
 	const entryId = item.chat ? undefined : item.entryId;
+	const edit = branch && entryId !== undefined;
+	const text = item.text.trim();
 	return (
 		<div className={`user ${item.chat ? "chat-message" : ""}`} data-entry={item.entryId}>
-			{branch && entryId !== undefined && (
-				<button
-					type="button"
-					className="edit-button"
-					aria-label="Edit"
-					title="Edit: continue the session before this message, with its text in the composer"
-					onClick={() => branch(entryId)}
-				>
-					<PencilIcon />
-				</button>
-			)}
-			{reply.button}
-			<div className="bubble" {...reply.gesture}>
-				{item.replyTo && (
-					<button
-						type="button"
-						className="reply-quote"
-						title="Show the message this answers"
-						onClick={() => item.replyTo && void revealEntry(item.replyTo.entryId, reveal)}
-					>
-						<ReplyIcon size={12} />
-						<strong>{item.replyTo.name}</strong> {item.replyTo.excerpt}
-					</button>
-				)}
-				{item.author && (
-					<div className="speaker">
-						{item.author.name}
-						{item.chat && " · chat"}
-					</div>
-				)}
-				{item.text}
-				{item.files.length > 0 && (
-					<div className="bubble-files">
-						{item.files.map((file) => (
-							<span key={file}>{file}</span>
-						))}
-					</div>
-				)}
-				<Images images={item.images} />
-				{item.note && <div className="bubble-note">{item.note}</div>}
+			<div className="user-line">
+				{reply.button}
+				<div className="bubble" {...reply.gesture}>
+					{item.replyTo && (
+						<button
+							type="button"
+							className="reply-quote"
+							title="Show the message this answers"
+							onClick={() => item.replyTo && void revealEntry(item.replyTo.entryId, reveal)}
+						>
+							<ReplyIcon size={12} />
+							<strong>{item.replyTo.name}</strong> {item.replyTo.excerpt}
+						</button>
+					)}
+					{item.author && (
+						<div className="speaker">
+							{item.author.name}
+							{item.chat && " · chat"}
+						</div>
+					)}
+					{item.text}
+					{item.files.length > 0 && (
+						<div className="bubble-files">
+							{item.files.map((file) => (
+								<span key={file}>{file}</span>
+							))}
+						</div>
+					)}
+					<Images images={item.images} />
+					{item.note && <div className="bubble-note">{item.note}</div>}
+				</div>
 			</div>
+			{/* Sent messages only: a queued one has neither its entry nor its time yet. */}
+			{item.entryId !== undefined && (text || item.at !== undefined || edit) && (
+				<div className="message-actions">
+					{item.at !== undefined && <Time at={item.at} className="message-time" />}
+					{edit && (
+						<button
+							type="button"
+							className="copy"
+							aria-label="Edit"
+							title="Edit: continue the session before this message, with its text in the composer"
+							onClick={() => branch(entryId)}
+						>
+							<PencilIcon />
+						</button>
+					)}
+					{text && <CopyButton text={text} />}
+				</div>
+			)}
 		</div>
 	);
 }
@@ -527,8 +551,8 @@ function Thought({ item }: { item: Extract<ChatItem, { type: "thought" }> }) {
 }
 
 /**
- * The agent's answer: the last text of its turn, as prose, with Copy, Branch and Reply once complete; a stop, an error
- * or the length limit below it.
+ * The agent's answer: the last text of its turn, as prose, with Copy, Branch, Reply and its time once complete; a stop,
+ * an error or the length limit below it.
  */
 const Answer = memo(function Answer({ item }: { item: Extract<ChatItem, { type: "answer" }> }) {
 	const reply = useReply(item.streaming ? undefined : item.entryId, "Pi");
@@ -555,6 +579,7 @@ const Answer = memo(function Answer({ item }: { item: Extract<ChatItem, { type: 
 								</button>
 							)}
 							{reply.button}
+							<Time at={message.timestamp} className="message-time" />
 						</div>
 					)}
 				</div>
@@ -745,6 +770,7 @@ export const Messages = memo(function Messages({
 }) {
 	const spacers = list.spacers(range);
 	const arriving = useArriving(rows);
+	const [slotHeights] = useState<SlotHeights>(() => new Map());
 	return (
 		<div className="messages">
 			{/* One height in every state: the edge changing never moves the transcript under the reader. It loads ahead
@@ -767,24 +793,37 @@ export const Messages = memo(function Messages({
 			)}
 			<div className="rows" ref={list.listRef} data-rows={rows.length}>
 				<div className="row-space" ref={list.topRef} style={{ height: spacers.before }} />
-				{rows.slice(range.start, range.end + 1).map((row) => {
-					const delay = arriving.get(row.key);
-					return (
-						<div
-							key={row.key}
-							className={["row", row.first ? "first" : "", delay === undefined ? "" : "arriving"]
-								.filter(Boolean)
-								.join(" ")}
-							style={delay ? { animationDelay: `${delay}ms` } : undefined}
-							data-row={row.key}
-							data-gap={row.first ? undefined : row.gap}
-							data-lead={row.lead ? "" : undefined}
-							ref={list.rowRef}
-						>
-							<ItemView item={row.item} />
-						</div>
-					);
-				})}
+				<SlotHeightsContext value={slotHeights}>
+					{rows.slice(range.start, range.end + 1).map((row, offset) => {
+						const index = range.start + offset;
+						const delay = arriving.get(row.key);
+						// The row after a finished wheel takes the place of its thought (activity/ThoughtSlot.tsx).
+						const held = handoff(slotHeights, rows[index - 1], index === rows.length - 1, transcript.working);
+						return (
+							<div
+								key={row.key}
+								className={["row", row.first ? "first" : "", delay === undefined ? "" : "arriving"]
+									.filter(Boolean)
+									.join(" ")}
+								style={
+									delay || held !== undefined
+										? {
+												...(delay ? { animationDelay: `${delay}ms` } : {}),
+												...(held === undefined ? {} : { minHeight: held }),
+											}
+										: undefined
+								}
+								data-row={row.key}
+								data-gap={row.first ? undefined : row.gap}
+								data-lead={row.lead ? "" : undefined}
+								data-handoff={held === undefined ? undefined : held ? "held" : "released"}
+								ref={list.rowRef}
+							>
+								<ItemView item={row.item} />
+							</div>
+						);
+					})}
+				</SlotHeightsContext>
 				<div className="row-space" ref={list.bottomRef} style={{ height: spacers.after }} />
 			</div>
 			{stopped && !transcript.busy && <output className="notice stopped">Stopped</output>}

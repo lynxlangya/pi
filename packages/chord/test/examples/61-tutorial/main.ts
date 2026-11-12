@@ -130,6 +130,10 @@ if (sandboxAvailable()) {
 	for (const line of screen(frames).trim().split("\r\n")) console.log(`   ${line}`);
 } else console.log("5. (the terminal client needs Node 26.5.1 or later for its sandbox)");
 
+// After the start, the app watches the files its bases were built from. On macOS, adding a watch briefly drops file
+// events for every watch of the process, so the new plugin directory below could go unnoticed: wait for it to finish.
+await app.baseWatched;
+
 // 6. A theme plugin added while the app runs: a new directory in the plugins root marks the set changed, and applying
 //    the changes builds it and rolls it out. Pages and terminals restyle in place.
 await cp(fileURLToPath(new URL("./later/harbor/", import.meta.url)), join(root, "harbor"), { recursive: true });
@@ -303,7 +307,7 @@ async function until(check: () => boolean): Promise<void> {
 
 /** An asset's URL with its content hash masked, so the output is the same at every run. */
 function hashless(asset: string): string {
-	return asset.replace(/\.[0-9a-f]{8,}\./, ".<hash>.");
+	return asset.replaceAll(/\.[0-9a-f]{8,}(?=\.)/g, ".<hash>");
 }
 
 /** The terminal's last frame as text (its colours stripped). */

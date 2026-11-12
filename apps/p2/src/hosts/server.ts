@@ -1,29 +1,42 @@
 // Server host: HTTP + WebSocket accept, routes `session:` hosts to session workers, loads the server facets.
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isChordError, type PluginFacet, webSocketLink } from "@earendil-works/chord";
 import { filesFacet } from "@earendil-works/chord/app/files";
+import { nodeCompression } from "@earendil-works/chord/compression";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { RolloutResult } from "@earendil-works/chord/plugins";
 import { WebSocketServer } from "ws";
+import { backupConfigured } from "../runtime/backup.ts";
 import { type Ctx, createHost, type Host, type HostError, hostErrorText, Server } from "../runtime/chord.ts";
 import { envDefaultModel } from "../runtime/default-model.ts";
 import { type DevCommand, type DevResult, parseDevCommand } from "../runtime/dev-protocol.ts";
 import { configureFetch } from "../runtime/fetch.ts";
-import { assertMigrated, hostFiles, openHostStore, serverDirectory } from "../runtime/host-dirs.ts";
+import {
+	assertMigrated,
+	hostFiles,
+	openHostStore,
+	serverDirectory,
+	userPluginsDirectory,
+} from "../runtime/host-dirs.ts";
 import { fromOrigin, sendJson } from "../runtime/http.ts";
 import { captureProcessLogs, processLogs } from "../runtime/logs.ts";
-import { hasLoopbackCookie, loopbackCookie } from "../runtime/loopback-cookie.ts";
+import { mintOwnerLink } from "../runtime/owner-link.ts";
 import { signIn } from "../runtime/page.ts";
 import { isGuest, isOwner, type P2Principal, SERVER } from "../runtime/principals.ts";
 import { takeProcessLock } from "../runtime/process-lock.ts";
 import {
 	Authenticators,
 	findRoute,
+	LinkTokens,
+	PageCookies,
+	type PluginApply,
+	type PluginOutcome,
 	type RequestAccess,
 	type RequestOrigin,
 	RequestResolvers,
@@ -44,8 +57,16 @@ import {
 } from "./bundles.ts";
 import { devControl } from "./dev.ts";
 import { readDevCommand, sendDevCommand, serveDevChannel } from "./dev-channel.ts";
-import { contentHash, LoadedModules, loadedModuleHashes, loadedPluginFiles } from "./dev-modules.ts";
-import { createP2Plugins, listPlugins, PLUGINS_DIRECTORY, SERVER_PACKAGES, selectPlugins } from "./plugins.ts";
+import { LoadedModules, loadedModuleHashes, loadedPluginFiles } from "./dev-modules.ts";
+import {
+	createP2Plugins,
+	listPlugins,
+	listRoots,
+	type P2Plugins,
+	PLUGINS_DIRECTORY,
+	SERVER_PACKAGES,
+	selectPlugins,
+} from "./plugins.ts";
 import {
 	contentSecurityPolicy,
 	foreignBrowserRequest,
@@ -57,7 +78,7 @@ import {
 import { SessionWorkers } from "./session-workers.ts";
 import { limitedSocket, MAX_CLIENT_FRAME } from "./socket-limits.ts";
 import { tuiPreferencesFacet } from "./tui-preferences.ts";
-import { createWeb, isPublicFile } from "./web.ts";
+import { createWeb, isAppPage, isPublicFile } from "./web.ts";
 
 /** The p2 app directory (`apps/p2`), told to facets as `Server.info.app` and `WorkerInit.app`. */
 const APP = fileURLToPath(new URL("../../", import.meta.url));
@@ -88,6 +109,12 @@ export type ServerOptions = {
 	readonly facets?: readonly PluginFacet<P2Principal>[];
 };
 
+/** The view kit's path, the one route a sandboxed frame's `Origin: null` request reaches (docs/rooms.md). */
+const VIEW_KIT = /^\/view-kit\/[0-9a-f]{64}\.js$/;
+
+/** A token link's path: `/chord/<kind>` (docs/rooms.md). */
+const TOKEN_LINK = /^\/chord\/([a-z][a-z0-9-]{0,31})$/;
+
 /** Old content-named files remain briefly so HTML returned just before a reload can finish loading. */
 const WEB_BUNDLE_GRACE_MS = 60_000;
 
@@ -110,27 +137,43 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	const resume: unknown = dev ? JSON.parse(process.env.P2_DEV_RESUME ?? "[]") : [];
 	if (!Array.isArray(resume) || !resume.every((id: unknown) => typeof id === "string"))
 		throw new Error("Invalid dev resume list");
-	// The selection: every plugin of plugins/, or exactly the requested ones (tests).
-	let plugins = selectPlugins(listPlugins(PLUGINS_DIRECTORY), options.plugins);
 	const dataDir = options.dataDir ?? process.env.P2_DATA_DIR ?? join(homedir(), ".pi", "p2");
+	// The user plugin root (`<data>/plugins/`): created here, so the plugin watcher watches it from the start.
+	const userRoot = userPluginsDirectory(dataDir);
+	mkdirSync(userRoot, { recursive: true, mode: 0o700 });
+	/** Where plugins are found, in order: the built-ins win a name. */
+	const roots = [PLUGINS_DIRECTORY, userRoot];
+	/**
+	 * The selection: every plugin of plugins/, or exactly the requested ones (tests), and every plugin of the user root
+	 * whose name no built-in has, alphabetical.
+	 */
+	const currentSelection = (): string[] => {
+		const builtIns = listPlugins(PLUGINS_DIRECTORY);
+		const user = [...listPlugins(userRoot).keys()].filter((name) => !builtIns.has(name));
+		return [...selectPlugins(builtIns, options.plugins), ...user].sort();
+	};
+	let plugins = currentSelection();
 	const devModules = dev
 		? new LoadedModules(loadedModuleHashes, loadedPluginFiles, join(dataDir, "dev-modules"))
 		: undefined;
 	const fake = options.fake ?? process.env.P2_FAKE === "1";
 	mkdirSync(join(dataDir, "sessions"), { recursive: true, mode: 0o700 });
+	// The local owner is whoever can read this directory's owner key, and not every file in it is 0600 (SQLite
+	// stores, mcp.json): a directory made before p2 (another umask) is made private too.
+	chmodSync(dataDir, 0o700);
 	// One server per data directory: a lock another server holds refuses the start after a short wait (a restart's old
 	// server may still be exiting).
 	const unlock = await takeProcessLock(`p2:server:${dataDir}`, 5000).catch((error: unknown) => {
 		throw new Error(`Another p2 server uses ${dataDir}`, { cause: error });
 	});
 	const allowedHosts = options.allowedHosts ?? parseAllowedHosts(process.env.P2_ALLOWED_HOSTS);
-	// The server's Chord store (`<data>/server/store.sqlite`): persisted documents and job runs of its host-lifetime
-	// objects (session lifecycle operations, search rebuilds) and its `Files` index. Its outbox stays off: local-only
-	// data never goes to a sync. p2's older SQLite files stay their owners' natives.
+	// The server's Chord store (`<data>/server/store.sqlite`): persisted documents, tables and job runs of its
+	// host-lifetime objects (the catalog, shares, subagents, session lifecycle operations) and its `Files` index. It keeps
+	// an outbox while backup is configured (`src/runtime/backup.ts`), which `plugins/backup` uploads.
 	let store: Awaited<ReturnType<typeof openHostStore>>;
 	try {
 		assertMigrated(dataDir);
-		store = await openHostStore(serverDirectory(dataDir), { outbox: false }, BACKGROUND_CONTEXT);
+		store = await openHostStore(serverDirectory(dataDir), { outbox: backupConfigured() }, BACKGROUND_CONTEXT);
 	} catch (error) {
 		await unlock();
 		throw error;
@@ -140,12 +183,20 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 		address: Server(),
 		principal: SERVER,
 		store,
+		// JSON parts above 16 KiB this host originates (snapshots of the catalogs) go deflated: the WebSocket does not
+		// compress, and a tunnel carries them as they are.
+		compression: nodeCompression,
 		onError: (error) => {
 			if (isOwnerNotice(error)) processLogs.notice("server", hostErrorText(error));
 			console.error("p2 server:", error);
 		},
 	});
-	const p2Plugins = createP2Plugins(options.plugins, (error) => console.error("p2 plugins:", error));
+	const p2Plugins = createP2Plugins(
+		options.plugins,
+		(error) => console.error("p2 plugins:", error),
+		BACKGROUND_CONTEXT,
+		userRoot,
+	);
 	const { plugins: chordPlugins } = p2Plugins;
 	// Listen first so plugins see the actual port, but capture requests/upgrades BEFORE listening.
 	// A reconnect can arrive while plugins load: without an upgrade listener Node treats it as
@@ -160,11 +211,13 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	});
 	http.on("upgrade", (request, socket, head) => {
 		const path = new URL(request.url ?? "/", "http://localhost").pathname;
+		/** `/chord/<kind>`: a link admitted by a token alone (`LinkTokens`). */
+		const tokenKind = TOKEN_LINK.exec(path)?.[1];
 		void loaded
-			.then(() => upgradePrincipal(request))
+			.then(() => (tokenKind === undefined ? upgradePrincipal(request) : tokenPrincipal(request, tokenKind)))
 			.catch(() => undefined)
 			.then(async (principal) => {
-				if (path === "/chord" && principal !== undefined) {
+				if ((path === "/chord" || tokenKind !== undefined) && principal !== undefined) {
 					upgraded.set(request, principal);
 					sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit("connection", ws, request));
 				} else if (principal !== undefined) {
@@ -196,7 +249,10 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 			dataDir,
 			fake,
 			entry: fileURLToPath(new URL("./worker.ts", import.meta.url)),
-			execArgv: ["--import", new URL("../source.ts", import.meta.url).href],
+			// A young generation of at most 2 MiB per semi-space (default 16): V8 grows it to 32 MiB committed during bursts
+			// and keeps most of it, about 26 MiB of every worker's private memory; the cap costs a few ms more minor GC
+			// per run (measured: 53 minor GCs instead of 14 over a start and a turn, 18-23 ms instead of 15, same CPU).
+			execArgv: ["--max-semi-space-size=2", "--import", new URL("../source.ts", import.meta.url).href],
 			env: {
 				...options.workerEnv,
 				...(dev ? { P2_DEV: "1", P2_DEV_MODULE_DIR: join(dataDir, "dev-modules") } : {}),
@@ -217,12 +273,13 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 		BACKGROUND_CONTEXT,
 	);
 	// Every session worker runs the worker base Chord bundled just now (not the files on disk): in dev mode its source
-	// files are a restart baseline, compared by content like the server's own modules.
+	// files are a restart baseline, compared by content like the server's own modules, with the bytes the build read
+	// (a read now could see an edit made since).
 	devModules?.set(
 		"worker-base",
-		workers.workers.inputs
-			.filter((file) => !file.startsWith(PLUGINS_DIRECTORY))
-			.map((file) => ({ file, hash: contentHash(readFileSync(file)) })),
+		[...workers.baseInputs]
+			.filter(([file]) => !file.startsWith(PLUGINS_DIRECTORY) && !file.startsWith(userRoot))
+			.map(([file, hash]) => ({ file, hash })),
 	);
 	// Capture before plugin resources open (e.g. provider SDK startup), not only after the logs facet activates.
 	const stopLogs = captureProcessLogs("server");
@@ -242,6 +299,7 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 		if (!devModules) return;
 		const plugin = (file: string) =>
 			file.startsWith(PLUGINS_DIRECTORY) ||
+			file.startsWith(userRoot) ||
 			(options.tuiDirectory !== undefined && file.startsWith(options.tuiDirectory));
 		devModules.set(
 			`${bundle}-bundle`,
@@ -257,7 +315,7 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	const getTuiBundle = (): Promise<TuiBundle> => {
 		if (tuiBundle) return tuiBundle;
 		let current!: Promise<TuiBundle>;
-		current = buildTuiBundle(plugins, options.tuiDirectory).then(
+		current = buildTuiBundle(plugins, options.tuiDirectory ?? roots).then(
 			(bundle) => {
 				if (tuiBundle === current) adoptTui(bundle);
 				return bundle;
@@ -275,7 +333,7 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	const getWebBundle = (): Promise<WebBundle> => {
 		if (webBundle) return webBundle;
 		let current!: Promise<WebBundle>;
-		current = buildWebBundle(plugins).then(
+		current = buildWebBundle(plugins, roots).then(
 			(bundle) => {
 				if (webBundle === current) adoptWeb(bundle);
 				return bundle;
@@ -321,6 +379,8 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 							resourceOptions: options.resources ?? {},
 							workers,
 							root: (fn, context) => host.root(fn, context),
+							store,
+							plugins: { root: userRoot, reload: (requested) => applyPlugins(requested) },
 						}),
 					},
 					{ name: "@p2/tui-preferences", facet: tuiPreferencesFacet(dataDir) },
@@ -346,6 +406,51 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 
 	let reloading = false;
 	/**
+	 * Builds `requested` (and plugins added since), then the TUI and web bundles of the new selection, then rolls the
+	 * build out to the server and every running worker and adopts the bundles. Stops before the rollout at the first
+	 * failed build (a facet's, or a bundle's): nothing changes then.
+	 */
+	const rebuild = async (requested: readonly string[]): Promise<Rebuilt> => {
+		const built = await chordPlugins.build(requested, BACKGROUND_CONTEXT);
+		const failed = built.facets.flatMap((facet) =>
+			facet.kind === "failed" ? [{ plugin: facet.plugin, kind: facet.facet, errors: facet.errors }] : [],
+		);
+		if (failed.length) return { kind: "failed", failed };
+		const next = currentSelection();
+		processLogs.append("server", "event", `Reloading plugins: ${requested.join(", ")}`);
+		// Prepare downloaded code before the backend commit; publish only a successfully committed selection.
+		let nextTuiBundle: TuiBundle;
+		let nextWebBundle: WebBundle | undefined;
+		try {
+			nextTuiBundle = await buildTuiBundle(next, options.tuiDirectory ?? roots);
+			nextWebBundle = serveWeb ? await buildWebBundle(next, roots) : undefined;
+		} catch (error) {
+			return { kind: "failed", failed: bundleFailures(error, roots) };
+		}
+		const result = await chordPlugins.rollout(
+			[chordPlugins.step("server", host), workers.workers.step("workers")],
+			built,
+			BACKGROUND_CONTEXT,
+		);
+		plugins = next;
+		tuiBundle = Promise.resolve(nextTuiBundle);
+		adoptTui(nextTuiBundle);
+		if (nextWebBundle) {
+			if (webBundle) {
+				retainedWebBundles.unshift({ bundle: webBundle, expires: Date.now() + WEB_BUNDLE_GRACE_MS });
+				retainedWebBundles.splice(2);
+			}
+			webBundle = Promise.resolve(nextWebBundle);
+			adoptWeb(nextWebBundle);
+		}
+		const changed = [...new Set(built.facets.map((facet) => facet.plugin))].sort();
+		for (const notice of processLogs.notices())
+			if (notice.source === "server" && notice.message.startsWith("Reload refused:"))
+				processLogs.dismissNotice(notice.id);
+		processLogs.append("server", "event", `Reloaded plugins: ${changed.join(", ")}`);
+		return { kind: "rolled", built, result, changed };
+	};
+	/**
 	 * Builds `requested` (and plugins added since), then rolls them out to the server and every running worker; the TUI
 	 * and web bundles are rebuilt first (a failed build keeps the old code and bundles). A plugin whose build or
 	 * evaluation fails keeps its old code (an added one stays out), reported in the result.
@@ -356,8 +461,8 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 		if (reloading) throw new Error("A p2 plugin reload is already running");
 		reloading = true;
 		try {
-			const listing = listPlugins(PLUGINS_DIRECTORY);
-			const next = selectPlugins(listing, options.plugins);
+			const listing = listRoots(roots);
+			const next = currentSelection();
 			// A loaded plugin whose directory is gone is removed by the reload.
 			for (const name of requested) {
 				if (next.includes(name) || (plugins.includes(name) && !listing.has(name))) continue;
@@ -365,49 +470,110 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 					listing.has(name) ? `Cannot reload unloaded p2 plugin: ${name}` : `Unknown p2 plugin: ${name}`,
 				);
 			}
-			const built = await chordPlugins.build(requested, BACKGROUND_CONTEXT);
-			const failed = built.facets.filter((facet) => facet.kind === "failed");
-			if (failed.length)
+			const rebuilt = await rebuild(requested);
+			if (rebuilt.kind === "failed")
 				throw new Error(
-					failed
-						.map(
-							(facet) =>
-								`${facet.plugin} (${facet.facet}): ${facet.kind === "failed" ? facet.errors.join("; ") : ""}`,
-						)
-						.join(". "),
+					rebuilt.failed.map((facet) => `${facet.plugin} (${facet.kind}): ${facet.errors.join("; ")}`).join(". "),
 				);
-			processLogs.append("server", "event", `Reloading plugins: ${requested.join(", ")}`);
-			// Prepare downloaded code before the backend commit; publish only a successfully committed selection.
-			const nextTuiBundle = await buildTuiBundle(next, options.tuiDirectory);
-			const nextWebBundle = serveWeb ? await buildWebBundle(next) : undefined;
-			const result = await chordPlugins.rollout(
-				[chordPlugins.step("server", host), workers.workers.step("workers")],
-				built,
-				BACKGROUND_CONTEXT,
-			);
-			plugins = next;
-			tuiBundle = Promise.resolve(nextTuiBundle);
-			adoptTui(nextTuiBundle);
-			if (nextWebBundle) {
-				if (webBundle) {
-					retainedWebBundles.unshift({ bundle: webBundle, expires: Date.now() + WEB_BUNDLE_GRACE_MS });
-					retainedWebBundles.splice(2);
-				}
-				webBundle = Promise.resolve(nextWebBundle);
-				adoptWeb(nextWebBundle);
-			}
-			const changed = [...new Set(built.facets.map((facet) => facet.plugin))].sort();
-			for (const notice of processLogs.notices())
-				if (notice.source === "server" && notice.message.startsWith("Reload refused:"))
-					processLogs.dismissNotice(notice.id);
-			processLogs.append("server", "event", `Reloaded plugins: ${changed.join(", ")}`);
-			return { plugins: changed, value: result };
+			return { plugins: rebuilt.changed, value: rebuilt.result };
 		} catch (error) {
 			processLogs.notice("server", `Reload refused: ${error instanceof Error ? error.message : String(error)}`);
 			throw error;
 		} finally {
 			reloading = false;
 		}
+	};
+	/**
+	 * Reloads plugins for `reload_plugins` (any root): `requested`, else every dirty plugin, every plugin of the user
+	 * root and every loaded plugin no longer on disk (an unchanged one keeps its digest, so its hosts keep it as it is).
+	 * Named plugins are discovered again when the watcher has not reported their change yet (`Plugins.build`), so an
+	 * agent's apply never depends on the watcher's timing: a plugin written just before is applied, one deleted just
+	 * before is removed. Says per plugin what happened: applied, removed, failed with the build's or
+	 * the hosts' errors (a failed build applies nothing), or refused (unknown, or an invalid package); and the errors
+	 * logged meanwhile.
+	 */
+	const applyPlugins = async (requested?: readonly string[]): Promise<PluginApply> => {
+		if (reloading)
+			return { refused: "Another plugin reload is running; try again in a moment.", plugins: [], logs: [] };
+		reloading = true;
+		const since = Date.now();
+		try {
+			const listed = listRoots(roots);
+			const builtIns = listPlugins(PLUGINS_DIRECTORY);
+			const state = chordPlugins.state.value;
+			const wanted =
+				requested ??
+				[
+					...new Set([
+						...state.dirty,
+						...state.install,
+						...[...listPlugins(userRoot).keys()].filter((name) => !builtIns.has(name)),
+						...plugins.filter((name) => !listed.has(name)),
+					]),
+				].sort();
+			const unknown = wanted.filter((name) => !listed.has(name) && !plugins.includes(name));
+			const names = wanted.filter((name) => !unknown.includes(name));
+			const rebuilt = await rebuild(names);
+			// After the build, which discovered the roots anew.
+			const refusals = [
+				...unknown.map((plugin) => ({ plugin, outcome: "refused" as const, errors: ["No such plugin"] })),
+				...(await discoveryProblems()),
+			];
+			const result: PluginApply =
+				rebuilt.kind === "failed"
+					? {
+							plugins: [
+								...rebuilt.failed.map(({ plugin, kind, errors }) => ({
+									plugin,
+									outcome: "failed" as const,
+									errors: errors.map((error) => `${kind}: ${error}`),
+								})),
+								...refusals,
+							],
+							logs: [],
+						}
+					: { plugins: [...rolledOutcomes(rebuilt), ...refusals], logs: [] };
+			watcher?.notify({
+				ok: result.plugins.every((each) => each.outcome === "applied" || each.outcome === "removed"),
+				message: result.plugins.map((each) => `${each.plugin}: ${each.outcome}`).join(", ") || "No dirty plugins",
+				plugins: result.plugins.map((each) => each.plugin),
+			});
+			return { ...result, logs: recentErrors(since) };
+		} finally {
+			reloading = false;
+		}
+	};
+	/** A rollout's outcome per plugin: applied, removed, or failed with the hosts' errors. */
+	const rolledOutcomes = (rebuilt: Extract<Rebuilt, { kind: "rolled" }>): PluginOutcome[] => {
+		const hostFailures = new Map<string, string[]>();
+		const fail = (plugin: string, text: string) =>
+			hostFailures.set(plugin, [...(hostFailures.get(plugin) ?? []), text]);
+		for (const step of rebuilt.result.steps)
+			for (const each of step.hosts) {
+				if ("report" in each)
+					for (const { plugin, error } of each.report.failed) fail(plugin, `${each.host}: ${errorText(error)}`);
+				else if ("error" in each)
+					for (const plugin of rebuilt.changed) fail(plugin, `${each.host}: ${errorText(each.error)}`);
+			}
+		return [
+			...Object.keys(rebuilt.built.plugins).map((plugin) => {
+				const errors = hostFailures.get(plugin);
+				return errors ? { plugin, outcome: "failed" as const, errors } : { plugin, outcome: "applied" as const };
+			}),
+			...rebuilt.built.removed.map((plugin) => ({ plugin, outcome: "removed" as const })),
+		];
+	};
+	/** Discovery's problems (an invalid or missing `package.json`, a name another root has), as refusals. */
+	const discoveryProblems = async (): Promise<PluginOutcome[]> => {
+		const reals = await Promise.all(roots.map((root) => realpath(root).catch(() => root)));
+		return chordPlugins.discovery.problems.map((problem) => {
+			const root = reals.find((each) => problem.path.startsWith(each + sep));
+			return {
+				plugin: root === undefined ? problem.path : relative(root, problem.path).split(sep)[0] || problem.path,
+				outcome: "refused" as const,
+				errors: [problem.error],
+			};
+		});
 	};
 	const watcher = dev
 		? devControl({
@@ -416,7 +582,7 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 				runtimeDirectory: APP,
 				loadedModules: devModules,
 				setChanges: () => {
-					const next = selectPlugins(listPlugins(PLUGINS_DIRECTORY), options.plugins);
+					const next = currentSelection();
 					return [
 						...next.filter((name) => !plugins.includes(name)),
 						...plugins.filter((name) => !next.includes(name)),
@@ -475,12 +641,11 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	const closeDevChannel = dev && !supervised ? await serveDevChannel(dataDir, execute) : undefined;
 
 	/**
-	 * Loopback is the device owner, except for a browser request another site made or frames (Fetch Metadata) other than
-	 * a top-level navigation to an app page: no clickjacking or cross-site driving of the owner UI (`resolveAccess` also
-	 * drops cookie principals of such requests). Tunnel requests are whoever an authenticator (a cookie) says. As in Pi
-	 * Mobile, the device owner's browser carries a loopback owner cookie (set when it loads the app), which wins
-	 * over a guest cookie; without it, a guest cookie wins over the cookieless loopback fallback, so a browser that
-	 * joined a share on loopback is that guest everywhere.
+	 * Who sent a request: an owner session cookie (a local one only on loopback), a guest cookie, a Radius user. An owner
+	 * wins over a guest cookie in the same browser. Loopback alone proves nothing (any user of the machine reaches it):
+	 * the local owner is whoever proved to run as the server's user (`src/runtime/local-owner.ts`) or redeemed an owner
+	 * link on loopback, and holds that local session cookie. Another site's requests lose every principal in
+	 * `resolveAccess`.
 	 */
 	const authenticate = async (
 		request: IncomingMessage,
@@ -490,16 +655,10 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 		let authenticated: P2Principal | undefined;
 		for (const authenticator of (await host.registry(Authenticators, ctx)).value.values()) {
 			const principal = await authenticator(request, origin, ctx);
-			// Associated owners stay remote even on localhost; a guest cookie cannot downgrade them.
 			if (isOwner(principal)) return principal;
 			authenticated ??= principal;
 		}
-		// A top-level page navigation from another site may load the app too (a link from another local port): it can
-		// neither be framed nor read back, and the page's own requests are same-origin.
-		const loopbackOwner = !origin.remote && (!foreignBrowserRequest(request) || pageNavigation(request));
-		if (loopbackOwner && authenticated !== undefined && hasLoopbackCookie(request, origin.port, dataDir))
-			return { kind: "owner", access: "local" };
-		return authenticated ?? (loopbackOwner ? { kind: "owner", access: "local" } : undefined);
+		return authenticated;
 	};
 	const credentialAccess = async (request: IncomingMessage, ctx: Ctx): Promise<RequestAccess | undefined> => {
 		for (const resolve of (await host.registry(RequestResolvers, ctx)).value.values()) {
@@ -547,12 +706,19 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 					// The Radius shell frames the relayed UI; X-Frame-Options cannot name another origin.
 					if (access.origin.relayShellOrigin !== undefined) response.removeHeader("X-Frame-Options");
 				}
-				if (access === undefined || !sameOrigin(request, access.origin)) {
+				// A sandboxed frame (an opaque origin: Chrome sends `Origin: null` even for its scripts) may load the view
+				// kit (views plugin, docs/rooms.md), and only that, as nobody: no cookie reaches the route.
+				const anonymous =
+					request.headers.origin === "null" &&
+					(request.method === "GET" || request.method === "HEAD") &&
+					VIEW_KIT.test(path);
+				if (access === undefined || (!anonymous && !sameOrigin(request, access.origin))) {
 					response.writeHead(403, { "Content-Type": "text/plain" });
 					response.end(access === undefined ? "Localhost only" : "Invalid origin");
 					return;
 				}
-				const { principal, origin } = access;
+				const { origin } = access;
+				const principal = anonymous ? undefined : access.principal;
 				// Unauthenticated readiness (Pi Mobile's /health, polled by launchers); known Hosts only.
 				if (path === "/health" && (request.method === "GET" || request.method === "HEAD")) {
 					response.writeHead(200, { "Content-Type": "application/json" });
@@ -575,7 +741,15 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 						response.end();
 					} else if (request.method === "POST") {
 						try {
-							const result = await execute(await readDevCommand(request));
+							const command = await readDevCommand(request);
+							// A supervised restart stops this server before the supervisor answers, which cancels this request
+							// (the client saw an empty 500). Answer first; the outcome arrives as the supervisor's dev notice.
+							if (command.action === "restart" && watcher && supervised) {
+								sendJson(response, 202, { ok: true, message: "Restarting server" });
+								void execute(command);
+								return;
+							}
+							const result = await execute(command);
 							sendJson(response, result.ok ? 200 : 409, result);
 						} catch (error) {
 							sendJson(response, 400, { ok: false, message: String(error) });
@@ -612,17 +786,15 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 				}
 				const route = findRoute((await host.registry(Routes, ctx)).value, request.method ?? "GET", path);
 				if (route !== undefined) return route(request, response, { principal, origin }, ctx);
-				// The local owner's browser loading the app gets the loopback owner cookie (Pi Mobile sets it on `/`).
-				if (
-					isOwner(principal) &&
-					principal.access === "local" &&
-					!origin.remote &&
-					(request.method === "GET" || request.method === "HEAD") &&
-					(path === "/" || path.startsWith("/s/"))
-				)
-					response.setHeader("Set-Cookie", loopbackCookie(origin.port, dataDir));
+				// An owner loading the app may get renewed cookies (a local session in use does not expire).
+				if (isOwner(principal) && (request.method === "GET" || request.method === "HEAD") && isAppPage(path)) {
+					const cookies = [...(await host.registry(PageCookies, ctx)).value.values()].flatMap(
+						(cookie) => cookie(request, { principal, origin }) ?? [],
+					);
+					if (cookies.length) response.setHeader("Set-Cookie", cookies);
+				}
 				if (isOwner(principal) || (isGuest(principal) && (await web?.guestMayLoad(request, principal)))) {
-					if (web !== undefined) return web.handle(request, response);
+					if (web !== undefined) return web.handle(request, response, origin.relayShellOrigin);
 					response.writeHead(404, { "Content-Type": "text/plain" });
 					response.end("Not found");
 					return;
@@ -639,7 +811,9 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 					response.end("Nothing on this brain is shared with you. Ask its owner for a share link.\n");
 					return;
 				}
-				signIn(request, response, 401);
+				// A link from another site may arrive without the owner's cookie (Chrome launching an installed app sent
+				// none): the page loads itself once more from this origin, which sends it.
+				signIn(request, response, 401, { reload: foreignBrowserRequest(request) && pageNavigation(request) });
 			}, BACKGROUND_CONTEXT)
 			.catch((error: unknown) => {
 				console.error("p2 server: request failed", error);
@@ -655,6 +829,26 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 			return access !== undefined && sameOrigin(request, access.origin) ? access.principal : undefined;
 		}, BACKGROUND_CONTEXT);
 	};
+	/**
+	 * The principal of a token link (`/chord/<kind>?token=…`), or undefined to refuse it. Its caller may be a sandboxed
+	 * frame: `Origin` may be `null` (or this server's own), and its cookies are never read. The Host must be one this
+	 * server answers (loopback, an allowed tunnel, a relay's): DNS rebinding is refused as for every request.
+	 */
+	const tokenPrincipal = async (request: IncomingMessage, kind: string): Promise<P2Principal | undefined> =>
+		host.root(async (ctx) => {
+			let origin: RequestOrigin | undefined;
+			for (const resolve of (await host.registry(RequestResolvers, ctx)).value.values()) {
+				origin = resolve(request, ctx)?.origin;
+				if (origin !== undefined) break;
+			}
+			origin ??= requestOrigin(request, allowedHosts);
+			const from = request.headers.origin;
+			if (origin === undefined || (from !== undefined && from !== "null" && from !== origin.origin))
+				return undefined;
+			const token = new URL(request.url ?? "/", "http://localhost").searchParams.get("token");
+			const admit = (await host.registry(LinkTokens, ctx)).value.get(kind);
+			return token && admit ? admit(token, ctx) : undefined;
+		}, BACKGROUND_CONTEXT);
 	const upgraded = new WeakMap<IncomingMessage, P2Principal>();
 	// Mobile's limits: frames up to 1 MiB, 4 MiB unsent output (socket-limits.ts); Chord queues calls behind its window.
 	sockets.on("connection", (socket, request: IncomingMessage) => {
@@ -722,6 +916,58 @@ export async function startServer(options: ServerOptions = {}): Promise<P2Server
 	};
 }
 
+/** What a rebuild did: stopped at failed builds, or rolled out (its build, the rollout, the plugins it changed). */
+type Rebuilt =
+	| {
+			readonly kind: "failed";
+			readonly failed: readonly { plugin: string; kind: string; errors: readonly string[] }[];
+	  }
+	| {
+			readonly kind: "rolled";
+			readonly built: Awaited<ReturnType<P2Plugins["plugins"]["build"]>>;
+			readonly result: RolloutResult;
+			readonly changed: readonly string[];
+	  };
+
+/** A bundle build's failure as failed facets: esbuild's errors with their files and lines, by plugin where it can tell. */
+function bundleFailures(
+	error: unknown,
+	roots: readonly string[],
+): { plugin: string; kind: string; errors: string[] }[] {
+	// esbuild's build failure (its `errors`); anything else is one message.
+	const messages = (
+		error as { errors?: { text: string; location?: { file: string; line: number; column: number } | null }[] }
+	).errors;
+	if (!Array.isArray(messages)) return [{ plugin: "bundle", kind: "web", errors: [errorText(error)] }];
+	const byPlugin = new Map<string, string[]>();
+	for (const { text, location } of messages) {
+		const file = location ? resolve(APP, location.file) : undefined;
+		const root = roots.find((each) => file?.startsWith(`${each}${sep}`));
+		// A plugin's file is named from its root (`counter/web.tsx`), as the plugin tools name it.
+		const path = file && root ? relative(root, file) : location?.file;
+		const plugin = path && root ? (path.split(sep)[0] ?? "bundle") : "bundle";
+		const where = location ? `${path}:${location.line}:${location.column}: ` : "";
+		byPlugin.set(plugin, [...(byPlugin.get(plugin) ?? []), `${where}${text}`]);
+	}
+	return [...byPlugin].map(([plugin, errors]) => ({ plugin, kind: "web", errors }));
+}
+
+/** An error's message. */
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Error lines of the server's and the workers' logs since `since` (the last few). */
+function recentErrors(since: number): string[] {
+	const lines: { time: number; text: string }[] = [];
+	for (const { id } of processLogs.sources())
+		for (const line of processLogs.lines(id))
+			if (line.time >= since && (line.level === "error" || line.level === "stderr"))
+				lines.push({ time: line.time, text: `${id}: ${line.text}` });
+	return lines
+		.sort((a, b) => a.time - b.time)
+		.slice(-20)
+		.map((line) => line.text.slice(0, 2000));
+}
+
 /**
  * Whether a server host error is an owner notice: not an object that ended, a hold its factory refused (`forbidden`:
  * the caller is told) or a worker's start (the session's own notice has it).
@@ -739,7 +985,18 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
 	// Provider logins and server plugins (e.g. the Radius gateway) fetch in this process too.
 	configureFetch();
 	const server = await startServer();
-	console.log(`p2: http://127.0.0.1:${server.port} (data ${server.dataDir})`);
+	const local = new URL(`http://127.0.0.1:${server.port}`);
+	console.log(`p2: ${local.origin} (data ${server.dataDir})`);
+	// A browser on this machine signs in once per profile by pasting this one-time token into the sign-in page (ten
+	// minutes; later ones: npm run owner-link). It is redacted from the server's log buffer; only the terminal shows it.
+	await mintOwnerLink(local, server.dataDir, local).then(
+		(link) => {
+			const token = link.hash.slice(1);
+			processLogs.redactor.addSecret(token);
+			console.log(`p2: sign-in token (one use, ten minutes; paste it at ${local.origin}): ${token}`);
+		},
+		(error: unknown) => console.error(`p2: no sign-in token: ${error instanceof Error ? error.message : error}`),
+	);
 	// Every way out goes through `process.exit`: a signal's default action skips the exit hooks, which remove the
 	// macOS lock socket file (else the next start refuses) and kill the MCP servers' process groups.
 	let stopping = false;

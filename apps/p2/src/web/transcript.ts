@@ -29,6 +29,11 @@ import { isInterruptedError } from "../runtime/tool-calls.ts";
 // Pure display model of a Durable view: tool calls are joined with their live
 // slot and result entry, so one card follows a call from request to result.
 export type ToolStatus = "pending" | "running" | "done" | "error" | "interrupted";
+
+/** A live slot's status as shown: a parked call (`sleeping`, `waiting`) is still busy, shown as running. */
+function shownStatus(status: "pending" | "running" | "sleeping" | "waiting"): ToolStatus {
+	return status === "sleeping" || status === "waiting" ? "running" : status;
+}
 export type ToolView = {
 	id: string;
 	name: string;
@@ -44,6 +49,8 @@ export type ToolView = {
 	calls?: readonly NestedCall[];
 	/** The result's recorded execution time. */
 	durationMs?: number;
+	/** When the call started, in ms: its result's time less its duration; absent until it has a result. */
+	at?: number;
 };
 /** One call a running tool made to another tool, as a status row. */
 export type NestedCall = {
@@ -138,6 +145,7 @@ function resultTool(result: ToolResultMessage, name = result.toolName): ToolView
 		details: result.details as JsonValue | undefined,
 		images: result.content.filter((part) => part.type === "image"),
 		...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
+		at: result.timestamp - (result.durationMs ?? 0),
 	};
 }
 
@@ -201,7 +209,7 @@ function nestedCalls(
 							: isInterruptedError(summary?.error)
 								? "interrupted"
 								: "error"
-						: slot.status,
+						: shownStatus(slot.status),
 				depth,
 				...(slot.status === "running" && slot.output ? { output: slot.output } : {}),
 				...(summary?.durationMs === undefined ? {} : { durationMs: summary.durationMs }),
@@ -489,7 +497,7 @@ export function buildTranscript(
 			const status: ToolStatus = slot
 				? slot.status === "done"
 					? "error"
-					: slot.status
+					: shownStatus(slot.status)
 				: busy && current
 					? "pending"
 					: "interrupted";

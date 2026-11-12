@@ -24,6 +24,7 @@ import {
 	method,
 	nativeOf,
 	type Subscribable,
+	serveKeyed,
 	serveNative,
 	signalOf,
 	untilAborted,
@@ -34,8 +35,10 @@ import {
 	harnessOf,
 	InputGates,
 	type Location,
+	PluginSkills,
 	type SessionLocation,
 	sameLocation,
+	sessionLock,
 	workerOf,
 } from "@p2/app/v1/worker";
 import type { LoadedPrompt } from "./context-files.ts";
@@ -71,17 +74,29 @@ type PromptLoads = {
 	loads: Subscribable<Loaded>;
 	/** The environment its files are read through (skills, when invoked). */
 	env: () => Promise<ExecutionEnv>;
+	/** Watches and loads anew (the plugins' skills directories changed); only on this machine, which lists them. */
+	rewatch: () => Promise<void>;
 	close: () => Promise<void>;
 };
 
 /** Where conversations find their prompt resources: the session's (following its moves) or their own location's. */
 type PromptFiles = {
 	readonly session: MovingPromptLoads;
+	/** Every open load watches and loads anew (the plugins' skills directories changed). */
+	rewatch: () => Promise<unknown>;
 	of: (id: ConversationId, context: Context, read?: DocumentReader) => Promise<PromptLoads>;
 };
 
-/** Watches the files at `at` (through `environment`) and loads them. */
-function promptLoads(dataDir: string, at: Location, environment: Promise<ExecutionEnv>): PromptLoads {
+/**
+ * Watches the files at `at` (through `environment`) and loads them; on this machine with the plugins' skills
+ * (`pluginSkills`, read at each watch's start).
+ */
+function promptLoads(
+	dataDir: string,
+	at: Location,
+	environment: Promise<ExecutionEnv>,
+	pluginSkills: () => readonly string[],
+): PromptLoads {
 	let current = EMPTY;
 	let closed = false;
 	const listeners = new Set<(loaded: Loaded) => void>();
@@ -92,41 +107,52 @@ function promptLoads(dataDir: string, at: Location, environment: Promise<Executi
 		for (const listener of [...listeners]) listener(loaded);
 	};
 	const remote = at.env;
-	const observer = environment.then((env) =>
-		promptObserver({
-			env,
-			directory: dataDir,
-			cwd: at.cwd,
-			paths: async () => (env instanceof RemoteExecutionEnv ? remotePaths(env.connection) : nodePath),
-			skillsRoot: async () =>
-				remote
-					? await env.absolutePath("~/.pi/p2/skills", BACKGROUND_CONTEXT).then((result) => {
-							if (!result.ok) throw new Error(result.error.message);
-							return result.value;
-						})
-					: join(dataDir, "skills"),
-			promptsRoot: async () =>
-				remote
-					? await env.absolutePath("~/.pi/p2/prompts", BACKGROUND_CONTEXT).then((result) => {
-							if (!result.ok) throw new Error(result.error.message);
-							return result.value;
-						})
-					: join(dataDir, "prompts"),
-			...(remote ? { remote } : {}),
-			fallbackMs: remote ? 30_000 : 2000,
-			apply: (prompt, error) => publish({ ...(prompt ? { prompt } : {}), ...(error ? { error } : {}) }),
-		}),
-	);
+	const watch = () =>
+		environment.then((env) =>
+			promptObserver({
+				env,
+				directory: dataDir,
+				cwd: at.cwd,
+				paths: async () => (env instanceof RemoteExecutionEnv ? remotePaths(env.connection) : nodePath),
+				skillsRoot: async () =>
+					remote
+						? await env.absolutePath("~/.pi/p2/skills", BACKGROUND_CONTEXT).then((result) => {
+								if (!result.ok) throw new Error(result.error.message);
+								return result.value;
+							})
+						: join(dataDir, "skills"),
+				promptsRoot: async () =>
+					remote
+						? await env.absolutePath("~/.pi/p2/prompts", BACKGROUND_CONTEXT).then((result) => {
+								if (!result.ok) throw new Error(result.error.message);
+								return result.value;
+							})
+						: join(dataDir, "prompts"),
+				...(remote ? { remote } : { pluginSkills }),
+				fallbackMs: remote ? 30_000 : 2000,
+				apply: (prompt, error) => publish({ ...(prompt ? { prompt } : {}), ...(error ? { error } : {}) }),
+			}),
+		);
+	const begin = (next: ReturnType<typeof watch>) =>
+		next
+			.then((value) => (closed ? undefined : value.start()))
+			.catch((error: unknown) => {
+				publish({ error: `Could not watch prompt resources (${error instanceof Error ? error.message : error})` });
+			});
+	let observer = watch();
 	// Not awaited by the resource: the object (and its registrations) go live at once; input waits on the gate.
-	const started = observer
-		.then((value) => (closed ? undefined : value.start()))
-		.catch((error: unknown) => {
-			publish({ error: `Could not watch prompt resources (${error instanceof Error ? error.message : error})` });
-		});
+	const started = begin(observer);
 	return {
 		started: () => started,
 		current: () => current,
 		env: () => environment,
+		rewatch: async () => {
+			if (remote || closed) return;
+			const previous = observer;
+			observer = watch();
+			await (await previous.catch(() => undefined))?.close();
+			await begin(observer);
+		},
 		loads: {
 			subscribe: (listener) => {
 				listeners.add(listener);
@@ -174,6 +200,7 @@ function movingPromptLoads(location: SessionLocation, open: (at: Location) => Pr
 		current: () => inner.current(),
 		started: () => inner.started(),
 		env: () => inner.env(),
+		rewatch: () => inner.rewatch(),
 		loads: {
 			subscribe: (listener) => {
 				listeners.add(listener);
@@ -226,18 +253,22 @@ function listedOf(loaded: LoadedPrompt): { templates: TemplateInfo[]; skills: Sk
 
 export default defineFacet((host) => {
 	serveNative(host, PromptFilesNative);
+	serveKeyed(host, PluginSkills);
 	host.serve(Prompt, (_params, self) => {
 		const worker = workerOf(self);
 		const harness = harnessOf(self);
+		const skills = self.registry(PluginSkills);
+		const pluginSkills = () => [...skills.value.values()].map((entry) => entry.dir).sort();
 		const filesResource = self.open(
 			async () => {
 				const environments = harness().environments;
 				const dataDir = worker().init.dataDir;
-				const open = (at: Location): PromptLoads => promptLoads(dataDir, at, environments.at(at));
+				const open = (at: Location): PromptLoads => promptLoads(dataDir, at, environments.at(at), pluginSkills);
 				const session = movingPromptLoads(worker().location, open);
 				const own = new Map<string, PromptLoads>();
 				const files: PromptFiles = {
 					session,
+					rewatch: () => Promise.all([session, ...own.values()].map((loads) => loads.rewatch())),
 					of: async (id, context, read) => {
 						const at = await environments.locate(id, context, read);
 						if (sameLocation(at, environments.session)) return session;
@@ -271,6 +302,27 @@ export default defineFacet((host) => {
 				await moved;
 			}
 		});
+		// A plugin's skills come and go with its reloads: this machine's loads watch and list the new directories.
+		self.onLive(async (ctx) => {
+			const watch = await skills.watch(ctx);
+			let listed = JSON.stringify(pluginSkills());
+			let chain = Promise.resolve();
+			watch.start(async (call) => {
+				if (call.kind !== "value" || JSON.stringify(pluginSkills()) === listed) return;
+				listed = JSON.stringify(pluginSkills());
+				chain = chain
+					.then(() => filesResource.value.files.rewatch())
+					.then(
+						() => {},
+						(error: unknown) => console.error("p2 prompt: watching plugins' skills:", error),
+					);
+			});
+			try {
+				await untilAborted(ctx);
+			} finally {
+				await watch.stop();
+			}
+		});
 		// Load failures of the session's resources go to the worker's log (they also leave the last good load in use).
 		self.onLive(async (ctx) => {
 			const stop = filesResource.value.files.session.loads.subscribe(({ error }) => {
@@ -287,6 +339,7 @@ export default defineFacet((host) => {
 				return filesResource.value.files.session;
 			},
 			of: (id, context, read) => filesResource.value.files.of(id, context, read),
+			rewatch: () => filesResource.value.files.rewatch(),
 		});
 		/**
 		 * The latest load where the conversation works. On this machine its first load is awaited (the session's is
@@ -297,6 +350,12 @@ export default defineFacet((host) => {
 			if (!(await harness().environments.locate(input.conversationId, context, input.read)).env)
 				await loads.started();
 			return loads.current();
+		};
+		/** What the conversation's prompt shows: a locked session gets the global instructions only when picked. */
+		const visible = async (input: PromptInput, context: Context) => {
+			const current = await loaded(input, context);
+			const lock = await sessionLock(input.read, context);
+			return lock && !lock.instructions ? (current.project ?? current) : current;
 		};
 		// Sections are rendered for every generation, for the conversation's location: they read its latest load.
 		const extension = defineExtension({
@@ -309,10 +368,10 @@ export default defineFacet((host) => {
 						(await harness().environments.locate(input.conversationId, context, input.read)).env,
 					),
 				),
-				section("agents-md", async (input, context) => (await loaded(input, context)).agents || undefined, {
+				section("agents-md", async (input, context) => (await visible(input, context)).agents || undefined, {
 					tag: false,
 				}),
-				section("skills", async (input, context) => (await loaded(input, context)).skills || undefined, {
+				section("skills", async (input, context) => (await visible(input, context)).skills || undefined, {
 					tag: false,
 				}),
 			],

@@ -6,7 +6,8 @@ import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import type { Watchable, WatchCall, WatchHandle } from "@earendil-works/chord/watch";
-import type { Models } from "@earendil-works/pi-ai/models";
+import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import type { Models, ModelsSimpleStreamOptions } from "@earendil-works/pi-ai/models";
 import {
 	type ConversationId,
 	configure,
@@ -113,8 +114,8 @@ export class SessionLocation {
 }
 
 /**
- * Whether `env` runs on this machine (not an SSH environment): p2's private data directory is denied there. Decided
- * from the environment, not from `SessionLocation.value`, which lags behind the environments during a move.
+ * Whether `env` runs on this machine (not an SSH environment; attachments need no copy there). Decided from the
+ * environment, not from `SessionLocation.value`, which lags behind the environments during a move.
  */
 export const isLocalEnvironment = (env: ExecutionEnv): boolean => !(env instanceof RemoteExecutionEnv);
 
@@ -188,13 +189,13 @@ export const HarnessEnvironments = keyedRegistry<HarnessEnvironmentEntry>("p2.ha
 
 /**
  * What keeps the worker process alive besides held references (Chord's own count): its Durable tasks, calls under way
- * (`call`), viewers plugins count themselves, and the relocation fence. A JSON watchable of those counts
- * (`workerMain`'s `busy`): the worker is idle when every count is zero.
+ * (`call`), viewers plugins count themselves, conversations whose prompt cache is kept warm, and the relocation fence.
+ * A JSON watchable of those counts (`workerMain`'s `busy`): the worker is idle when every count is zero.
  */
 export class Liveness implements Watchable<Readonly<Record<string, number>>> {
 	#relocating = false;
 	#stopping = false;
-	#counts: Readonly<Record<string, number>> = { activeCalls: 0, viewers: 0, durableTasks: 0 };
+	#counts: Readonly<Record<string, number>> = { activeCalls: 0, viewers: 0, durableTasks: 0, cacheWarming: 0 };
 	readonly #listeners = new Set<() => void>();
 	get value(): Readonly<Record<string, number>> {
 		return this.#counts;
@@ -232,7 +233,7 @@ export class Liveness implements Watchable<Readonly<Record<string, number>>> {
 		this.#counts = { ...this.#counts, [kind]: count };
 		for (const listener of [...this.#listeners]) listener();
 	}
-	add(kind: "activeCalls" | "viewers", delta: number): void {
+	add(kind: "activeCalls" | "viewers" | "cacheWarming", delta: number): void {
 		this.#set(kind, (this.#counts[kind] ?? 0) + delta);
 	}
 	setDurableTasks(count: number): void {
@@ -294,6 +295,11 @@ export type WorkerParts = {
 	 * `session`, which must not exist yet: a fork, whose worker waits while it copies. The session goes on meanwhile.
 	 */
 	readonly copyFilesTo: (session: string, context: Context) => Promise<void>;
+	/**
+	 * The session's Chord store (one writer: this worker), for its backup (`plugins/backup`). Never close it. Absent in
+	 * test hosts without a store.
+	 */
+	readonly store?: Store;
 };
 
 /**
@@ -330,6 +336,20 @@ export type HarnessParts = {
 	 * environments nothing uses any more.
 	 */
 	relocate(location: Location, context: Context): Promise<void>;
+	/** The request that produced `response`, for `GenerationTask`'s `afterResponse` hooks; each response is taken once. */
+	requestOf(response: AssistantMessage): ModelRequest | undefined;
+};
+
+/**
+ * One provider request the Harness sent: the model, the messages after Durable's `beforeRequest` chain, and the
+ * attempt's options without its `signal`, `telemetry` and `onPayload`. Read-only: the messages are Durable's (frozen)
+ * entry messages; never mutate, copy or freeze any of it. Sending it again skips Durable's `beforeProviderRequest`
+ * hooks (no p2 extension has one).
+ */
+export type ModelRequest = {
+	readonly model: Model<Api>;
+	readonly messages: readonly Message[];
+	readonly options: ModelsSimpleStreamOptions;
 };
 
 /** The session's Harness (the core's contribution once it is open). */
@@ -392,7 +412,7 @@ export function workerCore(
 		const own = sessionDirectory(init.dataDir, init.values.session.id);
 		const copyFilesTo = (session: string, context: Context) =>
 			copyFiles({ store, files: hostFiles(own) }, sessionDirectory(init.dataDir, session), context);
-		self.contribute(WorkerProcess, { init, liveness, location, root, copyFilesTo });
+		self.contribute(WorkerProcess, { init, liveness, location, root, copyFilesTo, store });
 		host.serve(HarnessNative, { compose: (table) => table[0]?.value });
 		host.serve(HarnessHost, (_params, self) => {
 			self.contribute(HarnessNative, openHarness(self, init, location, store));
@@ -665,10 +685,13 @@ function openHarness(self: Self, init: WorkerInit, location: SessionLocation, st
 		if (entry === undefined) throw new Error("No model configuration installed (models plugin)");
 		return entry;
 	};
-	// Model access is looked up at each use: the models plugin may reload or replace its configuration.
+	// Model access is looked up at each use: the models plugin may reload or replace its configuration. Every generation
+	// request passes through `streamSimple` here, after Durable and the Harness's identity wrapper completed it.
+	const requests = new WeakMap<AssistantMessage, ModelRequest>();
 	const models = new Proxy({} as Models, {
 		get: (_target, key) => {
 			const current = configured().models();
+			if (key === "streamSimple") return remembering(current, requests);
 			const value: unknown = Reflect.get(current, key, current);
 			return typeof value === "function" ? value.bind(current) : value;
 		},
@@ -777,6 +800,25 @@ function openHarness(self: Self, init: WorkerInit, location: SessionLocation, st
 				.retire([next, ...own])
 				.catch((error: unknown) => console.error("p2 worker: closing old environments:", error));
 		},
+		requestOf: (response) => {
+			const request = requests.get(response);
+			requests.delete(response);
+			return request;
+		},
+	};
+}
+
+/** `models.streamSimple` that remembers each request by its terminal message, for `HarnessParts.requestOf`. */
+function remembering(models: Models, requests: WeakMap<AssistantMessage, ModelRequest>): Models["streamSimple"] {
+	return (model, context, options) => {
+		const stream = models.streamSimple(model, context, options);
+		// Registered before the caller awaits result(): the entry exists when Durable's afterResponse hooks run.
+		// result() never rejects; pi-ai encodes failures as `stopReason: "error"`.
+		void stream.result().then((message) => {
+			const { signal: _signal, telemetry: _telemetry, onPayload: _onPayload, ...kept } = options ?? {};
+			requests.set(message, { model, messages: context.messages, options: kept });
+		});
+		return stream;
 	};
 }
 

@@ -12,6 +12,7 @@ import { powershellActivity } from "../../plugins/powershell/activity.tsx";
 import { sendFileActivity } from "../../plugins/send-file/activity.tsx";
 import { subagentActivity } from "../../plugins/subagents/activity.tsx";
 import { terminalActivity } from "../../plugins/terminals/activity.tsx";
+import { viewActivity } from "../../plugins/views/activity.tsx";
 import type { Detail, ToolActivityTable } from "../../src/web/activity/model.ts";
 import { Messages, rowEstimates, transcriptRows } from "../../src/web/Chat.tsx";
 import { ToolActivityContext } from "../../src/web/chat-context.ts";
@@ -32,6 +33,7 @@ export const PLUGIN_TOOLS: ToolActivityTable = new Map(
 		send_file: sendFileActivity,
 		subagent: subagentActivity,
 		terminal: terminalActivity,
+		view: viewActivity,
 	}),
 );
 
@@ -58,8 +60,17 @@ export function TranscriptFixture({
 		{ value: tools },
 		createElement(
 			"div",
-			{ className: "scroller transcript", ref: follow.scroller },
-			createElement(Messages, { transcript, rows, list: follow.list, range: follow.range }),
+			{ className: "app", style: { height: "100dvh" } },
+			createElement(
+				"main",
+				{ className: "main" },
+				createElement(
+					"div",
+					{ className: "scroller transcript", ref: follow.scroller },
+					createElement(Messages, { transcript, rows, list: follow.list, range: follow.range }),
+				),
+			),
+			createElement("div", { id: "side-dock", className: "side-dock" }),
 		),
 	);
 }

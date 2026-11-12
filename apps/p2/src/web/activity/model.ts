@@ -1,6 +1,6 @@
 // A turn's activity: what the agent did between a person's message and its answer. Derived from the transcript's
 // items: `chatItems` keeps each response's thinking and text in the transcript, in their order, and turns each run of
-// consecutive tool calls into an activity item (a wheel in the chat, its steps in a sheet). A turn's last text is its
+// consecutive tool calls into an activity item (a wheel in the chat, expandable steps in the right-hand panel). A turn's last text is its
 // answer, followed by the results meant for the person (artifacts, sent files, opened ports). A result its tool shows
 // in place (an inline artifact) comes right after its call instead, splitting the run of calls around it. How much of
 // that shows in the transcript, and how much goes on the wheels, is settings.json's `detail` (`Detail`).
@@ -25,6 +25,11 @@ export const DEFAULT_DETAIL: Detail = 2;
 export type Words = { kind: "thought" | "text"; id: string; text: string; live: boolean };
 /** What a wheel rolls through, in order: its tool calls, and at detail 1 and 2 thinking (and texts) among them. */
 export type WheelEntry = { kind: "call"; step: Step } | Words;
+
+/** The thought a working wheel shows below it: its newest, also while it streams; none once the wheel is done. */
+export function wheelThought(entries: readonly WheelEntry[], working: boolean): Words | undefined {
+	return working ? entries.findLast((entry): entry is Words => entry.kind === "thought") : undefined;
+}
 
 /** The items the chat shows: the transcript's people, markers and failures, and each turn's parts in order. */
 export type ChatItem =
@@ -260,7 +265,12 @@ function runItems(
 	// Working on a response that shows nothing yet (the first, or the next after a result in place): the activity row,
 	// waiting.
 	if (working && !answer && (!final || final.type === "results"))
-		items.push({ type: "activity", key: `activity:${final ? final.key : after}`, steps: [], working: true });
+		items.push({
+			type: "activity",
+			key: `activity:${final ? final.key : after}`,
+			steps: [],
+			working: true,
+		});
 	if (response && (answer || notice))
 		items.push({
 			type: "answer",
@@ -541,6 +551,11 @@ export type ToolActivity = {
 	describe?: (step: Step) => Described;
 	/** Its words while it runs ("Running npm test"); without it, `describe`'s. */
 	running?: (step: Step) => Label;
+	/**
+	 * One or two words for a call while it runs, where there is room for no more and its arguments are not known (a
+	 * subagent's row in the sidebar: "Reading"); without it, the tool's name.
+	 */
+	brief?: string;
 	/** Its main argument for its row in the sheet (`cwd`: the session's working directory, for relative paths). */
 	argument?: (tool: ToolView, cwd: string | undefined) => string;
 	/** How a failed call's row says it failed ("exit 1"); without it, "failed". */
@@ -556,8 +571,8 @@ export type ToolActivity = {
 	 * inline: the run of calls splits around it). `false` or absent: nothing.
 	 */
 	hasResult?: (tool: ToolView) => ResultPlacement | false;
-	/** The call's detail in the sheet; `onGroup` opens one of its own calls (`tool.calls`, grouped by `groupCalls`). */
-	Detail?: ComponentType<{ step: Step; onGroup: (index: number) => void }>;
+	/** The call's inline detail; `NestedCalls` expands the calls it made in place. */
+	Detail?: ComponentType<{ step: Step }>;
 	/**
 	 * The calls this call made to other tools (a script's), when its tool keeps their final list in its result's
 	 * `details`: read from there once settled. `tool.calls` holds the ones Durable shows (live, or the last seen); return
