@@ -51,6 +51,11 @@ import {
 	isOpenRouterModel,
 	type OpenRouterUsageAccounting,
 } from "../utils/openrouter-cost.ts";
+import {
+	applyOpenRouterNativeFinishReason,
+	flagOpenRouterEmptyStop,
+	readOpenRouterNativeFinishReason,
+} from "../utils/openrouter-finish-reason.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -441,6 +446,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
+					onErrorResponse: (errorResponse) => options?.onResponse?.(errorResponse, model),
 				},
 			);
 			// 注：onResponse 钩子：拿到 HTTP 状态码和响应头（比如限流相关的头）。
@@ -473,6 +479,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			let textBlock: TextContent | null = null;
 			let thinkingBlock: ThinkingContent | null = null;
 			let hasFinishReason = false;
+			const isOpenRouter = isOpenRouterModel(model);
+			// OpenRouter's native_finish_reason, only ever set for OpenRouter models, so the checks on it below
+			// are OpenRouter-only. Kept across chunks so a trailing chunk that repeats finish_reason without it
+			// does not drop it.
+			let nativeFinishReason: string | undefined;
 			const toolCallBlocksByIndex = new Map<number, ToolCall>();
 			const toolCallBlocksById = new Map<string, ToolCall>();
 			const toolCallStates = new Map<ToolCall, ToolCallState>();
@@ -653,6 +664,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					output.usage = parseChunkUsage((choice as any).usage, model);
 				}
 
+				if (isOpenRouter) {
+					nativeFinishReason = readOpenRouterNativeFinishReason(choice) ?? nativeFinishReason;
+				}
+
 				// 注：finish_reason 到达 = 模型说"我说完了"。映射成 pi 的 StopReason，原始值保留在 rawStopReason 便于排查。
 				if (choice.finish_reason) {
 					output.rawStopReason = choice.finish_reason;
@@ -664,6 +679,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					);
 					if (finishReasonResult.errorMessage) {
 						output.errorMessage = finishReasonResult.errorMessage;
+					}
+					if (nativeFinishReason) {
+						applyOpenRouterNativeFinishReason(output, choice.finish_reason, nativeFinishReason);
 					}
 					hasFinishReason = true;
 				}
@@ -788,6 +806,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			// 注：有的服务从不发 finish_reason（compat.supportsFinishReason=false），只能按"有没有工具调用"推断。
 			if (!hasFinishReason && !compat.supportsFinishReason) {
 				output.stopReason = output.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+			}
+			if (nativeFinishReason) {
+				flagOpenRouterEmptyStop(output, nativeFinishReason);
 			}
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");
@@ -1085,11 +1106,6 @@ function buildParams(
 			};
 		} else if (model.thinkingLevelMap?.off !== null) {
 			openRouterParams.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
-		}
-	} else if (compat.thinkingFormat === "ant-ling" && model.reasoning && options?.reasoningEffort) {
-		const effort = model.thinkingLevelMap?.[options.reasoningEffort];
-		if (typeof effort === "string") {
-			(params as typeof params & { reasoning?: { effort: string } }).reasoning = { effort };
 		}
 	} else if (compat.thinkingFormat === "together" && model.reasoning) {
 		const togetherParams = params as Omit<typeof params, "reasoning_effort"> & {
@@ -1880,14 +1896,13 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		requiresToolsWithToolHistory: false,
 		requiresThinkingAsText: false,
 		requiresReasoningContentOnAssistantMessages: isDeepSeek,
-		thinkingFormat: isDeepSeek
-			? "deepseek"
-			: isZai
-				? "zai"
-				: isTogether
-					? "together"
-					: isAntLing
-						? "ant-ling"
+		thinkingFormat:
+			isDeepSeek || isAntLing
+				? "deepseek"
+				: isZai
+					? "zai"
+					: isTogether
+						? "together"
 						: isOpenRouter
 							? "openrouter"
 							: "openai",

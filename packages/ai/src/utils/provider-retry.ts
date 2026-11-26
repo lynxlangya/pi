@@ -1,6 +1,8 @@
 // 注：HTTP 请求层的重试（在拿到响应流之前）。openai-completions.ts 的 stream 里用它包住 client.chat.completions.create。
 // 注：为什么不用 SDK 自带重试：SDK 的退避计时器不理会 AbortSignal，用户取消时还会傻等。所以 SDK 设 maxRetries: 0，由这里接管。
+import type { ProviderResponse } from "../types.ts";
 import { learnLog } from "./diagnostics.ts";
+import { headersToRecord } from "./headers.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
@@ -11,6 +13,11 @@ interface ProviderRetryOptions {
 	/** HTTP statuses that fail at once although the default policy would retry them. */
 	/** 译：即使默认策略会重试，也要立即失败的 HTTP 状态码。 */
 	noRetryStatuses?: readonly number[];
+	/**
+	 * Called for each attempt that failed with an HTTP status, before the retry decision. SDKs reject non-2xx
+	 * responses, so this is the only place their status and headers reach the caller's `onResponse`.
+	 */
+	onErrorResponse?: (response: ProviderResponse) => void | Promise<void>;
 }
 
 interface ProviderError extends Error {
@@ -133,6 +140,10 @@ export async function retryProviderRequest<T>(
 			// 注：已取消 → 立即抛；次数用完、不是 HTTP 错误、不可重试、或在 noRetryStatuses 里 → 原样抛出。
 			// 注：抛出的错误会被 stream 的 catch 接住，变成 error 事件。
 			if (options.signal?.aborted) throw createAbortError();
+			if (isProviderError(error) && error.status !== undefined) {
+				const headers = error.headers ? headersToRecord(error.headers) : {};
+				await options.onErrorResponse?.({ status: error.status, headers });
+			}
 			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) {
 				// 注：[调试] 注意 maxRetries 默认是 0，所以不传 maxRetries 时 429/5xx 也会直接失败
 				learnLog(

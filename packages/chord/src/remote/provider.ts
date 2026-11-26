@@ -10,7 +10,7 @@
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import { type Context, withAbortSignal } from "../context/index.ts";
 import { ChordError, type FailureCause, isChordError, type Principal } from "../data/index.ts";
-import { asChordError } from "../data/internal.ts";
+import { asChordError, stackless } from "../data/internal.ts";
 import {
 	asRemoteOldWork,
 	type Caller,
@@ -161,7 +161,7 @@ export class ProviderSide implements EventSender {
 		const closing = this.link.host.closing;
 		const entries = [...this.#entries.values()];
 		this.#entries.clear();
-		const closed = new ChordError({ code: "unavailable", message: "the link closed" });
+		const closed = stackless({ code: "unavailable", message: "the link closed" });
 		const relayed: RelayedCall[] = [];
 		for (const call of this.#calls.values()) {
 			if (call.kind === "served") call.abort.abort(closed);
@@ -225,7 +225,7 @@ export class ProviderSide implements EventSender {
 	 * A message from upstream link `from` for this origin's relayed holds, forwarded with this origin: `bound` and
 	 * `state` join the window's senders (their `ack` goes back to `from`), a reply ends its call (after this host's own
 	 * waiting state: `reply`), `gone` forgets its hold. A hold's calls still waiting for the upstream window are rejected
-	 * before its `loading` (`unavailable`: they carry the old variant's method indexes; its forwarded ones are kept),
+	 * before its `loading` (`unavailable`: they carry the old binding's method indexes; its forwarded ones are kept),
 	 * `failed` or `gone` (with that cause) is forwarded. A link answers only for what was relayed over it: an entry, a
 	 * notice or a reply naming a hold (or a call) this origin did not relay over `from` is dropped (Q1); a `bound` or
 	 * `state` left without entries is acknowledged to `from` at once. Parts travel unchecked and unparsed: the end that
@@ -282,7 +282,7 @@ export class ProviderSide implements EventSender {
 				const error =
 					forwarded.kind === "failed"
 						? this.#failure(hold, forwarded.cause)
-						: new ChordError({ code: "unavailable", message: `hold ${hold.id}: rebinding` });
+						: stackless({ code: "unavailable", message: `hold ${hold.id}: rebinding` });
 				this.#rejectRelayed(hold, error, "queued");
 				this.send(forwarded);
 			}
@@ -346,7 +346,7 @@ export class ProviderSide implements EventSender {
 	 */
 	forget(hold: Hold | RelayedHold, error?: ChordError): void {
 		if (this.#entries.get(hold.id) === hold) this.#entries.delete(hold.id);
-		const reason = error ?? new ChordError({ code: "released", message: `hold ${hold.id}: released` });
+		const reason = error ?? stackless({ code: "released", message: `hold ${hold.id}: released` });
 		let relayed: RelayedCall[] | undefined;
 		for (const [id, call] of this.#calls) {
 			if (call.hold !== hold) continue;
@@ -396,7 +396,7 @@ export class ProviderSide implements EventSender {
 	}
 
 	/**
-	 * An event flush's entry for served hold `hold`'s event member `member` (an index into its bound variant's). While
+	 * An event flush's entry for served hold `hold`'s event member `member` (an index into its binding's). While
 	 * this host's event window is full for this origin it is dropped as visited (counted), before anything is encoded:
 	 * nothing waits for a slow consumer, and no value is encoded only to be dropped (the window cannot change during a
 	 * flush: acks arrive in other turns, and this side sends one message per flush). Otherwise it is queued for this
@@ -555,7 +555,7 @@ export class ProviderSide implements EventSender {
 	 * arguments from a child (clients never compress) are protocol errors. On a relayed hold it is forwarded, its
 	 * arguments checked against this link's part limit first (the bytes are here). On a served hold that is not callable
 	 * (not bound yet, nor rebinding by the names its consumer still has after a `loading`) it is
-	 * refused `not_ready`; its method is an index into the bound variant (one outside it is a protocol error) and its
+	 * refused `not_ready`; its method is an index into the binding's methods (one outside them is a protocol error) and its
 	 * arguments are opened and parsed here within the hold's limits (past one the call fails `too_large/part`; a
 	 * malformed part is a protocol error), absent ones `null`. Arguments this host must inflate asynchronously are
 	 * inflated first, then the call is handled again.
@@ -699,7 +699,7 @@ export class ProviderSide implements EventSender {
 				for (const id of sender.holds) {
 					const hold = this.#relayedHold(id, sender.from);
 					if (hold === undefined) continue;
-					const error = new ChordError({ code: "unavailable", message: `hold ${id}: rebound` });
+					const error = stackless({ code: "unavailable", message: `hold ${id}: rebound` });
 					this.#rejectRelayed(hold, error, "queued");
 				}
 				break;

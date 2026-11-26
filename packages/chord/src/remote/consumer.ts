@@ -11,7 +11,7 @@ import type { TelemetryCarrier } from "@earendil-works/pi-telemetry";
 import type { Context } from "../context/index.ts";
 import { type MethodData, takesNoArgs } from "../contracts/internal.ts";
 import { ChordError, isChordError } from "../data/index.ts";
-import { asChordError } from "../data/internal.ts";
+import { asChordError, stackless } from "../data/internal.ts";
 import { revoked } from "../host/internal.ts";
 import {
 	type BoundEntry,
@@ -51,7 +51,7 @@ type OutgoingCall = {
 	 * cancels its own calls only (decision "References share one wire hold").
 	 */
 	readonly owner: object;
-	/** The method's index in the bound variant and its arguments' part. */
+	/** The method's index in the binding's methods and its arguments' part. */
 	readonly method: number;
 	readonly args: Part | undefined;
 	readonly segments: readonly Uint8Array[] | undefined;
@@ -110,7 +110,7 @@ export class ConsumerSide {
 	}
 
 	/**
-	 * Calls method `method` (an index into the bound variant) on hold `hold` with `args`: left out for a method without
+	 * Calls method `method` (an index into the binding's methods) on hold `hold` with `args`: left out for a method without
 	 * arguments, with byte segments when its argument schema has a `bytes()` leaf, deflated above the threshold except on
 	 * the parent link; with the carrier of `context`'s span when its adapter propagates. The result is parsed here. The
 	 * caller's cancellation rejects it at once and sends `abort` when it is in flight. `owner` is the reference making it.
@@ -186,7 +186,7 @@ export class ConsumerSide {
 			this.#link.send({ kind: "abort", call: id });
 		}
 		for (const _ of sent) this.#window.freed();
-		const error = new ChordError({ code: "released", message: `${label}: released` });
+		const error = stackless({ code: "released", message: `${label}: released` });
 		for (const call of waiting) call.reject(error);
 		for (const [, call] of sent) call.reject(error);
 	}
@@ -273,7 +273,7 @@ export class ConsumerSide {
 
 	/** The link closed: calls in flight and waiting reject `unavailable` (never resent, §7); the tables are dropped. */
 	closed(): void {
-		const error = new ChordError({ code: "unavailable", message: "the link closed" });
+		const error = stackless({ code: "unavailable", message: "the link closed" });
 		const calls = [...this.#calls.values(), ...this.#window.clear()];
 		this.#calls.clear();
 		this.#entries.clear();
@@ -430,13 +430,13 @@ export class ConsumerSide {
 
 	/**
 	 * `loading`: the hold's object, or its relay's upstream, starts over; its calls still waiting for a slot reject
-	 * `unavailable` (they may name a method of the old variant), its calls in flight wait for their reply (a provider's
+	 * `unavailable` (they may name a method of the old binding), its calls in flight wait for their reply (a provider's
 	 * `loading` keeps them; a relay's upstream drop answered them before).
 	 */
 	#loading(hold: number): void {
 		const holder = this.#entries.get(hold);
 		if (holder === undefined) return;
-		const error = new ChordError({ code: "unavailable", message: `hold ${hold}: rebinding` });
+		const error = stackless({ code: "unavailable", message: `hold ${hold}: rebinding` });
 		for (const call of this.#window.removeHold(hold)) call.reject(error);
 		holder.loading();
 	}

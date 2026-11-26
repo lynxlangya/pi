@@ -10,6 +10,7 @@ import {
 import {
 	enableOpenAiGrammarTools,
 	enableOpenAiMidConvoSystemMessages,
+	OPENAI_DECISIONS_COST,
 	OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
 	OPENAI_MID_CONVO_EFFORT_MODEL_IDS,
 	OPENAI_STANDARD_COSTS,
@@ -55,11 +56,8 @@ const NONE_REASONING_MODEL_IDS = new Set([
 	"gpt-6-luna",
 ]);
 
-// OpenAI Decisions API (public beta): gpt-6-luna is its only model. It bills input tokens only,
-// with the same long-context multiplier as chat requests. Usage reports cache reads and writes
-// within input_tokens; they are priced at the input rate here, so splitting them out of input
-// does not change the cost. Only API keys work: Sign in with ChatGPT
-// tokens are rejected on /v1/decisions, and the Codex backend has no Decisions route.
+// OpenAI Decisions API (public beta): gpt-6-luna is its only model. Only API keys work: Sign in with
+// ChatGPT tokens are rejected on /v1/decisions, and the Codex backend has no Decisions route.
 // The endpoint rejects inputs above 922K tokens (the model's documented maximum input), but
 // requests running longer than about five seconds, currently above roughly 600K input tokens,
 // fail with a gateway timeout.
@@ -73,7 +71,7 @@ const CLASSIFIER_MODELS: ClassifierModel<"openai-decisions">[] = [
 		provider: "openai",
 		baseUrl: BASE_URL,
 		input: ["text", "image"],
-		cost: withOpenAiLongContextPricing({ input: 0.1, output: 0, cacheRead: 0.1, cacheWrite: 0.1 }),
+		cost: OPENAI_DECISIONS_COST,
 		contextWindow: 922000,
 	},
 ];
@@ -121,6 +119,11 @@ export default defineProvider({
 		// those models accept `prompt_cache_options`; older models reject the parameter.
 		// https://developers.openai.com/api/docs/guides/prompt-caching
 		if (model.cost.cacheWrite > 0) mergeCompat(responsesModel, { supportsExplicitPromptCacheMode: true });
+		// No `promptCache`, so pi does not warm OpenAI prompt caches. Before GPT-5.6, caching is best
+		// effort with no fixed lifetime and no write charge: a refresh has no expiry to time and little
+		// to save. From GPT-5.6, entries live 30 minutes (12 hours with `ttl: "12h"`, at twice the write
+		// price). That outlasts pi's 30-minute idle warming window, and every real request renews the
+		// entry, so warming does not look worth it. Decided from the documented lifetimes, not measured.
 		if (OPENAI_MID_CONVO_EFFORT_MODEL_IDS.has(model.id)) {
 			mergeCompat(responsesModel, { supportsMidConvoEffort: true });
 		}

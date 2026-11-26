@@ -15,10 +15,10 @@ import { BACKGROUND_CONTEXT, type Host } from "@p2/app/v1";
 import { Backup } from "../../plugins/backup/contract.ts";
 import { openFolderRemote } from "../../plugins/backup/target.ts";
 import { backupFiles } from "../../plugins/backup/uploader.ts";
-import { Chat } from "../../plugins/chat/contract.ts";
-import { type Session, Sessions } from "../../plugins/sessions/contract.ts";
+import { CHAT_PARTICIPANT, Chat } from "../../plugins/chat/contract.ts";
+import { SESSIONS_OWNER, type Session, Sessions } from "../../plugins/sessions/contract.ts";
 import { type P2Server, startServer } from "../../src/hosts/server.ts";
-import { clientHost, type Fixture, holdIn, localOwner, startFixture, until } from "./helpers.ts";
+import { clientHost, type Fixture, holdWith, localOwner, startFixture, until } from "./helpers.ts";
 
 const answers = (count: number) => (view: ConversationView | null | undefined) =>
 	(JSON.stringify(view?.entries ?? []).match(/Echo:/g)?.length ?? 0) >= count &&
@@ -55,7 +55,12 @@ describe("backup to a folder (fake provider)", () => {
 	});
 
 	const send = async (session: Session, text: string, count: number) => {
-		const chat = await holdIn(fixture.browser(), Chat, { session: session.id, conversation: 1 }, "participant");
+		const chat = await holdWith(
+			fixture.browser(),
+			Chat,
+			{ session: session.id, conversation: 1 },
+			...CHAT_PARTICIPANT,
+		);
 		try {
 			await chat.send({ text, requestId: crypto.randomUUID() }, BACKGROUND_CONTEXT);
 			await until(chat.view, answers(count));
@@ -65,7 +70,7 @@ describe("backup to a folder (fake provider)", () => {
 	};
 
 	it("uploads the server's store and a session's, a finished turn within a second, and restores the session", async () => {
-		const sessions = await holdIn(fixture.browser(), Sessions, {}, "owner");
+		const sessions = await holdWith(fixture.browser(), Sessions, {}, ...SESSIONS_OWNER);
 		const session = await sessions.create({ cwd: fixture.workspace, title: "Backed up" }, BACKGROUND_CONTEXT);
 		const name = `session-${session.id}`;
 		const backup = await fixture.server.host.get(Backup, {}, BACKGROUND_CONTEXT);
@@ -173,7 +178,7 @@ describe("backup across restarts (fake provider)", () => {
 	};
 
 	const send = async (owner: Host, session: string, text: string, count: number) => {
-		const chat = await holdIn(owner, Chat, { session, conversation: 1 }, "participant");
+		const chat = await holdWith(owner, Chat, { session, conversation: 1 }, ...CHAT_PARTICIPANT);
 		try {
 			await chat.send({ text, requestId: crypto.randomUUID() }, BACKGROUND_CONTEXT);
 			await until(chat.view, answers(count));
@@ -224,7 +229,7 @@ describe("backup across restarts (fake provider)", () => {
 		let name = "";
 		let first = 0;
 		await withServer(true, async (server, owner) => {
-			const sessions = await holdIn(owner, Sessions, {}, "owner");
+			const sessions = await holdWith(owner, Sessions, {}, ...SESSIONS_OWNER);
 			session = (await sessions.create({ cwd: workspace, title: "Gap" }, BACKGROUND_CONTEXT)).id;
 			sessions.release();
 			name = `session-${session}`;
@@ -234,7 +239,20 @@ describe("backup across restarts (fake provider)", () => {
 		});
 
 		// Off: the stores open without an outbox (its commits dropped), and the session commits a turn the backup misses.
-		await withServer(false, (_server, owner) => send(owner, session, "while off", 2));
+		await withServer(false, async (server, owner) => {
+			await send(owner, session, "while off", 2);
+			// Backed up before, off now: paused, not nothing; its last backed-up sequence is still known.
+			const backup = await server.host.get(Backup, {}, BACKGROUND_CONTEXT);
+			try {
+				const paused = await until(backup.statuses, (value) => {
+					const status = value?.[name];
+					return status?.state === "paused" && status.reason === "off" && (status.syncedHead ?? 0) >= first;
+				});
+				assert.equal(paused?.server?.state, "paused", "the server's store too");
+			} finally {
+				backup.release();
+			}
+		});
 
 		// On again: the outbox starts at the store's head, past what the backup holds, so the next slot is a full copy
 		// after it (before, uploads failed here and were retried forever).
@@ -261,7 +279,7 @@ describe("backup across restarts (fake provider)", () => {
 		let session = "";
 		let head = 0;
 		await withServer(true, async (server, owner) => {
-			const sessions = await holdIn(owner, Sessions, {}, "owner");
+			const sessions = await holdWith(owner, Sessions, {}, ...SESSIONS_OWNER);
 			session = (await sessions.create({ cwd: workspace, title }, BACKGROUND_CONTEXT)).id;
 			sessions.release();
 			await send(owner, session, "first", 1);
@@ -295,8 +313,14 @@ describe("backup across restarts (fake provider)", () => {
 			const backup = await server.host.get(Backup, {}, BACKGROUND_CONTEXT);
 			try {
 				await send(owner, session, "after the other machine", 2);
-				const stopped = await until(backup.statuses, (value) => value?.[name]?.state === "diverged", 20_000);
-				assert.match(stopped?.[name]?.error ?? "", /stopped until a restart/);
+				const stopped = await until(
+					backup.statuses,
+					(value) => {
+						const status = value?.[name];
+						return status?.state === "stopped" && status.reason === "diverged";
+					},
+					20_000,
+				);
 				// Later commits upload nothing and report nothing.
 				const at = stopped?.[name]?.at;
 				await send(owner, session, "again", 3);

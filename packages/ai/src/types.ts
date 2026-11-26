@@ -97,7 +97,7 @@ export type KnownClassifierApi =
 	| "cloudflare-workers-ai-system-one"
 	| "llama-cpp-classify"
 	| "openai-decisions"
-	| "pi-classifier";
+	| "pi-decision";
 
 export type ClassifierApi = KnownClassifierApi | (string & {});
 
@@ -211,7 +211,9 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	 */
 	onPayload?: (payload: unknown, model: TModel) => unknown | undefined | Promise<unknown | undefined>;
 	/**
-	 * Optional callback invoked after an HTTP response is received.
+	 * Optional callback invoked after each HTTP response is received, including error responses and
+	 * responses to retried attempts. Coverage depends on provider and transport: some report empty headers or
+	 * only some responses.
 	 */
 	/** 译：收到 HTTP 响应后调用的可选回调（可以读到状态码和响应头，例如限流相关的 header）。 */
 	onResponse?: (response: ProviderResponse, model: TModel) => void | Promise<void>;
@@ -269,10 +271,12 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 // 注：StreamOptions = 各协议通用的流式请求选项。各协议的专属选项（如 AnthropicOptions）在它基础上扩展。
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
-	 * Optional callback invoked after an HTTP response is received and before
-	 * its body stream is consumed.
+	 * Optional callback invoked after each HTTP response is received, including error responses and
+	 * responses to retried attempts. Successful responses are reported before their body stream is consumed.
+	 * Coverage depends on provider and transport: some report empty headers or only some responses.
 	 *
-	 * 译：收到 HTTP 响应后、开始消费响应体流之前调用的可选回调。
+	 * 译：每次收到 HTTP 响应后调用，包括错误响应和重试响应。成功响应在读取响应体之前报告。
+	 * 覆盖范围取决于 provider 和传输方式。有些只报告部分响应，或报告空的响应头。
 	 */
 	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
 	/**
@@ -919,8 +923,13 @@ export interface ClassifierResult {
 	provider: ProviderId;
 	model: string;
 	answers: Record<string, ClassifierAnswer>;
-	/** Token usage and its cost at the model's catalog price, when the service reports token counts. */
+	/**
+	 * Token usage and its cost, when the service reports token counts. The cost is the model's catalog price,
+	 * or the billed amount (`cost.totalFromProvider`) when the service reports one, such as OpenRouter.
+	 */
 	usage?: Usage;
+	/** Provider-specific response identifier when the service reports one, such as OpenRouter's generation ID. */
+	responseId?: string;
 	stopReason: ClassifierStopReason;
 	errorMessage?: string;
 	timestamp: number; // Unix timestamp in milliseconds

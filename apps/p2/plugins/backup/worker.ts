@@ -3,12 +3,12 @@
 // Inert while backup is off (the server's `device` is null). The device is the server's: the one it stamps on every
 // slot, which an upload compares with a taken slot's to tell its own lost answer from another machine's upload.
 import type { CommitPublication } from "@earendil-works/pi-durable";
-import { defineFacet, expectVariant, INPUT_ENTRY, local, untilAborted } from "@p2/app/v1";
+import { defineFacet, INPUT_ENTRY, local, untilAborted } from "@p2/app/v1";
 import { backupTarget, processLogs, sessionDirectory } from "@p2/app/v1/node";
 import { harnessOf, workerOf } from "@p2/app/v1/worker";
 import { ChunkedRemote } from "./chunked-remote.ts";
 import { BackupRemote, isTerminalBackupError, sessionStoreName } from "./contract.ts";
-import { BackupUploader, backupFiles, backupTargetKey, errorText } from "./uploader.ts";
+import { BackupUploader, backupFiles, backupTargetKey, errorText, pausedWhileOff } from "./uploader.ts";
 
 /** The worker's backup of its store, for the worker's life. */
 const StoreBackup = local("p2.store-backup", { version: 1, params: {}, members: {} });
@@ -19,12 +19,18 @@ export default defineFacet((host) => {
 		const harness = harnessOf(self);
 		const remote = self.get(BackupRemote, {});
 		self.onLive(async (ctx) => {
-			const device = expectVariant(remote, "worker").device.value;
+			const device = remote.device.value;
 			const target = backupTarget();
-			if (device === null || target === undefined) return;
 			const { init, store, root } = worker();
-			if (store === undefined) return;
 			const session = init.values.session.id;
+			if (target === undefined) {
+				// Backup is off: a store backed up before says so (paused), instead of nothing.
+				const files = backupFiles(init.dataDir);
+				const paused = await pausedWhileOff(files, sessionDirectory(init.dataDir, session), ctx);
+				if (paused !== undefined) await remote.report({ status: paused }, ctx);
+				return;
+			}
+			if (device === null || store === undefined) return;
 			const name = sessionStoreName(session);
 			const log = (message: string): void => processLogs.append(`backup:${name}`, "event", message);
 			const uploader = new BackupUploader({
@@ -32,7 +38,7 @@ export default defineFacet((host) => {
 				name,
 				device,
 				remote: new ChunkedRemote(name, (fn, context) =>
-					root(async (inner) => fn(expectVariant(await inner.get(BackupRemote, {}), "worker"), inner), context),
+					root(async (inner) => fn(await inner.get(BackupRemote, {}), inner), context),
 				),
 				directory: sessionDirectory(init.dataDir, session),
 				// The server's target (the worker inherits its environment): bookmarks are per target.
@@ -42,16 +48,12 @@ export default defineFacet((host) => {
 				terminal: isTerminalBackupError,
 				// The account the server's target writes as now: asked on every upload, as the server may sign in again.
 				account: (context) =>
-					root(
-						async (inner) => expectVariant(await inner.get(BackupRemote, {}), "worker").account({}, inner),
-						context,
-					),
+					root(async (inner) => (await inner.get(BackupRemote, {})).account({}, inner), context),
 				// A status the server misses is replaced by the next one; the failure goes to the session's log.
 				report: (status) =>
-					void root(
-						async (inner) => expectVariant(await inner.get(BackupRemote, {}), "worker").report({ status }, inner),
-						ctx,
-					).catch((error: unknown) => log(`reporting the backup status failed: ${errorText(error)}`)),
+					void root(async (inner) => (await inner.get(BackupRemote, {})).report({ status }, inner), ctx).catch(
+						(error: unknown) => log(`reporting the backup status failed: ${errorText(error)}`),
+					),
 			});
 			// Every commit of the session's Durable records; the urgent ones leave the machine first.
 			const observation = harness().durable.observeCommits({
